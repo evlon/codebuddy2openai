@@ -187,6 +187,7 @@ class CredentialManager:
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODELS = [
+    "hy3",
     "glm-5.2", "glm-5.1", "glm-5v-turbo",
     "kimi-k2.7", "kimi-k2.6", "kimi-k2.5",
     "deepseek-v4-pro", "deepseek-v4-flash",

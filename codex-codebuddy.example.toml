@@ -30,5 +30,5 @@ env_key = "CODEBUDDY2OPENAI_KEY"   # 转换器未启用 --api-key 时，可随�
 
 # 2) 定义一个使用该提供商的 profile（仅支持该配置格式的客户端需要）
 [profiles.codebuddy]
-model = "glm-5.2"                  # 也可用 kimi-k2.7 / deepseek-v4-pro / auto 等
+model = "hy3"                  # 也可用 kimi-k2.7 / deepseek-v4-pro / auto 等
 model_provider = "codebuddy"
