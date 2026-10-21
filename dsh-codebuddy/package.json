@@ -1,0 +1,19 @@
+{
+  "name": "@local/dsh-codebuddy-preset",
+  "version": "1.0.2",
+  "private": true,
+  "type": "module",
+  "description": "CodeBuddy agent preset for dsh: official CodeBuddy identity persona + escape-codec decoder section + shadows the DeepSeek Harness identity line",
+  "exports": { ".": "./index.js", "./package.json": "./package.json" },
+  "meta": {
+    "title": "CodeBuddy Preset",
+    "description": "CodeBuddy Code identity face + escape-codec decoder; based on the standard preset. Best paired with the codebuddy2openai converter (--user-escape)."
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-system-prompt": "0.1.7-rc.2",
+    "@deepseek-ai/cordis": "~4.0.4"
+  }
+}
