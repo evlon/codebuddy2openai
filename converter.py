@@ -9,6 +9,8 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
   - 转换器只做两件事：①注入鉴权 header（Authorization / X-User-Id 等）
     ②在本地 /v1/* 与后端 /v2/* 之间做路径映射与透传。
   - token 过期时自动调 `/v2/plugin/auth/token/refresh` 刷新，并回写 auth 文件。
+  - 模型列表动态获取：调后端 `/v3/config`（官方 CLI 同款接口），取 agents 里
+    name="cli" 的 models（即官方 /model 选择器的可用列表），带 TTL 缓存与失败兜底。
 
 跨平台：自动定位 auth 目录（macOS / Windows / Linux）。
 依赖：fastapi + uvicorn + httpx（pip install fastapi "uvicorn[standard]" httpx）。
@@ -17,6 +19,7 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
   python3 converter.py                       # 默认 127.0.0.1:8787
   python3 converter.py --port 9000
   python3 converter.py --api-key mysecret    # 启用客户端鉴权
+  python3 converter.py --models-ttl 60       # 模型列表缓存 60 秒（默认 600）
 """
 
 from __future__ import annotations
@@ -48,6 +51,14 @@ except ImportError:  # 模块缺失时降级为不脱敏
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 USER_AGENT = "codebuddy2openai/2.0"
+
+# /v3/config（动态模型目录）对 User-Agent 有校验，须模拟官方 CLI 形态。
+# 逆向自 @tencent-ai/codebuddy-code 2.169.0（UserAgentHttpInterceptor.buildUserAgent）并实测：
+#   - UA 须含 "CLI/<x> CodeBuddy/<y>" 两段；缺 "CodeBuddy/<y>" → HTTP 400 code=12403
+#     ("check ua, get coding copilot version error")；缺 "CLI/<x>" → HTTP 200 但不下发
+#     models / agents（空配置）；"CodeBuddy-Code/2.169.0" 之类的名字不识别。
+#   - <y> 版本号内容不校验（"abc" 亦通过），此处跟随官方 CLI 当前版本。
+CONFIG_UA = "CLI/unknown CodeBuddy/2.169.0"
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -186,13 +197,105 @@ class CredentialManager:
 # 模型列表
 # ---------------------------------------------------------------------------
 
+# 离线兜底：/v3/config 里 "cli" agent models 的实测快照（2026-06，服务端持续更新，
+# 正常情况 /v1/models 走动态获取，此列表仅在后端不可达时救急）。
 DEFAULT_MODELS = [
-    "hy3",
-    "glm-5.2", "glm-5.1", "glm-5v-turbo",
-    "kimi-k2.7", "kimi-k2.6", "kimi-k2.5",
-    "deepseek-v4-pro", "deepseek-v4-flash",
-    "minimax-m3-pay", "hy3-preview-agent", "auto",
+    "auto",
+    "hy4-preview", "hy3", "hy3-x", "step-5-preview", "space-bunny",
+    "deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1",
+    "glm-5v-turbo", "minimax-m3", "minimax-m2.7", "kimi-k3-1",
+    "kimi-k2.8-preview", "kimi-k2.7", "kimi-k2.6", "deepseek-v4-pro", "mimo-v2.6-pro",
 ]
+
+
+class ModelCatalog:
+    """动态模型目录：拉取官方 CLI 同款的 /v3/config，TTL 缓存 + 失败兜底。
+
+    实测（逆向自 @tencent-ai/codebuddy-code 2.169.0 的 CloudProductProvider）：
+      GET {BACKEND}/v3/config → {"code":0,"data":{
+          "models":[{id,name,credits,maxInputTokens,...}, ...],       # 全量模型元数据（含图像等非对话模型）
+          "agents":[{"name":"cli","models":["hy3","glm-5.3",...], ...}] # 当前账号实际可用的模型 id 列表
+      }}
+      - agents 里 name="cli" 的 models 就是官方 CLI /model 选择器展示的可用列表；
+      - 鉴权头与 chat 一致（Authorization/X-User-Id/...），但 UA 必须用官方形态（见 CONFIG_UA）；
+      - 官方客户端还有内存 8 分钟 + 磁盘 last-good 两级缓存，这里简化为 TTL + 上次成功结果兜底。
+    """
+
+    def __init__(self, cred: CredentialManager, ttl: float = 600.0):
+        self.cred = cred
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._models: list[dict] = []      # 全量元数据（服务端顺序）
+        self._available: list[str] = []    # cli agent 可用模型 id（服务端顺序）
+        self._fetched_at: float = 0.0
+        self._error: str | None = None
+
+    def _fetch_locked(self) -> bool:
+        """同步拉一次 /v3/config。调用方须持锁。"""
+        headers = self.cred.get_headers()  # token 临期自动刷新
+        headers["User-Agent"] = CONFIG_UA
+        headers["Connection"] = "close"
+        try:
+            with httpx.Client(timeout=15) as c:
+                r = c.get(f"{BACKEND}/v3/config", headers=headers)
+            j = r.json()
+        except Exception as e:
+            self._error = f"{type(e).__name__}: {e}"
+            return False
+        if r.status_code != 200 or j.get("code") != 0:
+            self._error = f"HTTP {r.status_code} code={j.get('code')} {j.get('msg', '')}"
+            return False
+        data = j.get("data") or {}
+        models = [m for m in (data.get("models") or []) if isinstance(m, dict) and m.get("id")]
+        cli = next((a for a in (data.get("agents") or [])
+                    if isinstance(a, dict) and a.get("name") == "cli"), None)
+        available = [m for m in ((cli or {}).get("models") or []) if isinstance(m, str)]
+        if not models and not available:
+            self._error = "响应里没有 models/agents"
+            return False
+        self._models = models
+        self._available = available
+        self._fetched_at = time.time()
+        self._error = None
+        _log(f"[models] /v3/config 拉取成功：{len(available)} 个可用模型，{len(models)} 条元数据")
+        return True
+
+    def get(self, force: bool = False) -> tuple[list[str], list[dict]]:
+        """返回 (可用模型 id 列表, 模型元数据列表)。
+
+        TTL 内直接用缓存（force=True 或过期则重拉）；重拉失败时依次兜底：
+        上次成功结果 → DEFAULT_MODELS（内置快照）。
+        """
+        with self._lock:
+            if not force and self._models and (time.time() - self._fetched_at) < self.ttl:
+                return list(self._available), self._models
+            if self._fetch_locked():
+                return list(self._available), self._models
+            if self._models:
+                _log(f"[models] /v3/config 拉取失败（{self._error}），使用上次成功结果（{len(self._available)} 个）")
+                return list(self._available), self._models
+            _log(f"[models] /v3/config 拉取失败（{self._error}），使用内置兜底列表（{len(DEFAULT_MODELS)} 个）")
+            return list(DEFAULT_MODELS), []
+
+    def summary(self) -> dict:
+        with self._lock:
+            return {
+                "available": list(self._available),
+                "metadata_count": len(self._models),
+                "fetched_at": self._fetched_at,
+                "fresh": bool(self._models) and (time.time() - self._fetched_at) < self.ttl,
+                "last_error": self._error,
+                "ttl_seconds": self.ttl,
+            }
+
+
+def _model_ids_with_auto(available: list[str]) -> list[str]:
+    """对外暴露的模型 id 列表：保留 "auto"（converter 默认槽位名，后端接受）在首位。"""
+    ids = list(available or [])
+    if "auto" not in ids:
+        ids.insert(0, "auto")
+    return ids
+
 
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
 PASSTHROUGH_BODY_KEYS = {
@@ -207,9 +310,10 @@ PASSTHROUGH_BODY_KEYS = {
 # FastAPI 应用
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="codebuddy2openai", version="2.0")
+app = FastAPI(title="codebuddy2openai", version="2.1")
 CONFIG: dict = {"api_key": "", "cred": None, "log_path": None,
-                "desensitize": False}  # cred: CredentialManager | None
+                "desensitize": False, "catalog": None, "models_ttl": 600.0}
+# cred: CredentialManager | None; catalog: ModelCatalog | None
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +335,6 @@ def _log(msg: str):
                 f.write(line)
     except OSError:
         pass  # 日志失败不应影响主流程
-
 
 
 
@@ -259,6 +362,12 @@ def _cred() -> CredentialManager:
     return CONFIG["cred"]
 
 
+def _catalog() -> ModelCatalog:
+    if CONFIG["catalog"] is None:
+        raise HTTPException(status_code=503, detail={"error": {"message": "未找到登录凭据，请先在桌面端登录 CodeBuddy/WorkBuddy", "type": "auth_error"}})
+    return CONFIG["catalog"]
+
+
 @app.get("/health")
 def health():
     cred = CONFIG["cred"]
@@ -269,16 +378,48 @@ def health():
             info["credential"] = cred.summary()
         except Exception as e:
             info["credential_error"] = str(e)
+    if CONFIG.get("catalog") is not None:
+        try:
+            info["models"] = CONFIG["catalog"].summary()
+        except Exception as e:
+            info["models_error"] = str(e)
     return info
 
 
 @app.get("/v1/models")
-def list_models(authorization: Optional[str] = Header(default=None),
+def list_models(refresh: int = 0,
+                authorization: Optional[str] = Header(default=None),
                 x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """动态模型列表。默认走缓存（TTL 由 --models-ttl 控制）；?refresh=1 强制重拉。"""
     _check_auth(authorization, x_api_key)
+    available, _meta = _catalog().get(force=bool(refresh))
+    ids = _model_ids_with_auto(available)
     data = [{"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
-            for m in DEFAULT_MODELS]
+            for m in ids]
     return {"object": "list", "data": data}
+
+
+@app.get("/v1/models/{model_id}")
+def retrieve_model(model_id: str,
+                   authorization: Optional[str] = Header(default=None),
+                   x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """单个模型详情（OpenAI 协议 GET /v1/models/{model}），附带后端元数据字段。"""
+    _check_auth(authorization, x_api_key)
+    available, meta = _catalog().get()
+    ids = _model_ids_with_auto(available)
+    if model_id not in ids:
+        raise HTTPException(status_code=404, detail={
+            "error": {"message": f"The model '{model_id}' does not exist",
+                      "code": "model_not_found", "type": "invalid_request_error"}})
+    item = {"id": model_id, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
+    m = next((x for x in meta if x.get("id") == model_id), None)
+    if m:
+        # 追加非标准但有用的元数据（OpenAI SDK 客户端会忽略未知字段）
+        for k in ("name", "credits", "maxInputTokens", "maxOutputTokens",
+                  "supportsImages", "supportsToolCall", "vendor"):
+            if k in m:
+                item[k] = m[k]
+    return item
 
 
 @app.post("/v1/chat/completions")
@@ -579,6 +720,16 @@ def preflight() -> bool:
         except Exception as e:
             sys.stderr.write(f"[警告] 读取凭据失败：{e}\n")
             ok = False
+    # 预热动态模型目录（失败不阻塞启动，/v1/models 会重试并兜底）
+    catalog = CONFIG.get("catalog")
+    if catalog is not None:
+        try:
+            available, _meta = catalog.get(force=True)
+            ids = _model_ids_with_auto(available)
+            preview = ", ".join(ids[:6]) + ("…" if len(ids) > 6 else "")
+            sys.stderr.write(f"模型列表  : 动态获取成功，{len(ids)} 个（{preview}）\n")
+        except Exception as e:
+            sys.stderr.write(f"[警告] 动态模型预取失败：{e}（将使用内置兜底列表，/v1/models 访问时自动重试）\n")
     sys.stderr.write("================\n")
     return ok
 
@@ -595,6 +746,10 @@ def main():
     ap.add_argument("--desensitize", action="store_true",
                     help="启用脱敏：对 system 消息里的合规模板敏感词（DoS/exploit/credential 等）"
                          "插入零宽空格，缓解被后端内容审核误拦。默认关闭。")
+    ap.add_argument("--models-ttl", type=float,
+                    default=float(os.environ.get("CODEBUDDY2OPENAI_MODELS_TTL", 600)),
+                    help="动态模型列表的缓存秒数（默认 600；0 表示每次 /v1/models 都实时拉取）。"
+                         "也可用环境变量 CODEBUDDY2OPENAI_MODELS_TTL。")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     args = ap.parse_args()
 
@@ -604,13 +759,17 @@ def main():
     CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
     af = find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None
+    CONFIG["models_ttl"] = args.models_ttl
+    CONFIG["catalog"] = (ModelCatalog(CONFIG["cred"], ttl=args.models_ttl)
+                         if CONFIG["cred"] else None)
 
     if not args.skip_check:
         preflight()
 
     sys.stderr.write(f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n")
-    sys.stderr.write("   GET  /v1/models\n")
-    sys.stderr.write("   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n")
+    sys.stderr.write("   GET  /v1/models                （动态获取，带缓存；?refresh=1 强制刷新）\n")
+    sys.stderr.write("   GET  /v1/models/{model}      （单个模型详情，附后端元数据）\n")
+    sys.stderr.write("   POST /v1/chat/completions      （原生 tools/tool_calls，支持流式）\n")
     sys.stderr.write("   GET  /health\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
@@ -618,6 +777,7 @@ def main():
         sys.stderr.write(f"   日志      : {CONFIG['log_path']}\n")
     if args.desensitize:
         sys.stderr.write("   脱敏      : 已启用（system 合规词零宽处理）\n")
+    sys.stderr.write(f"   模型缓存  : {args.models_ttl:g} 秒（--models-ttl 可调）\n")
     sys.stderr.write("按 Ctrl+C 退出。\n\n")
 
     # 启动时写一条标记
