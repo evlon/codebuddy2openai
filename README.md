@@ -112,8 +112,12 @@ env_key = "CODEBUDDY2OPENAI_KEY"
 ### 🧪 curl 验证
 
 ```bash
-# 列模型
+# 列模型（每个模型附上下文窗口元数据：max_input_tokens / context_length / max_output_tokens）
 curl http://127.0.0.1:8787/v1/models
+
+# 单模型详情（另含 vLLM/LM Studio 风格别名 max_model_len / max_context_length
+# 及 name/credits/vendor/supportsImages/supportsToolCall 等后端元数据）
+curl http://127.0.0.1:8787/v1/models/auto
 
 # 非流式
 curl http://127.0.0.1:8787/v1/chat/completions \

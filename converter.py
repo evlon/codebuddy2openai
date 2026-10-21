@@ -541,6 +541,33 @@ def _model_ids_with_auto(available: list[str]) -> list[str]:
     return ids
 
 
+def _meta_model_id(model_id: str) -> str:
+    """"auto" 是档位槽位名，其容量元数据对应 /v3/config 里的 "default" 条目（保守值）。"""
+    return "default" if model_id == "auto" else model_id
+
+
+def _context_fields(meta: dict, aliases: bool = False) -> dict:
+    """从 /v3/config 元数据提取上下文相关字段（snake_case + 常见客户端别名）。
+
+    上下文窗口字段让客户端（agent 自动压缩 / 手动裁剪）能按模型真实容量做决策，
+    避免会话历史超过 maxInputTokens 时被后端拒绝。
+    """
+    out: dict = {}
+    mi = meta.get("maxInputTokens")
+    mo = meta.get("maxOutputTokens")
+    if isinstance(mi, int) and mi > 0:
+        out["max_input_tokens"] = mi
+        out["context_length"] = mi
+    if isinstance(mo, int) and mo > 0:
+        out["max_output_tokens"] = mo
+    if aliases and isinstance(mi, int) and mi > 0:
+        out["max_model_len"] = mi        # vLLM 风格
+        out["max_context_length"] = mi   # LM Studio 风格
+    if aliases and isinstance(meta.get("maxAllowedSize"), int) and meta["maxAllowedSize"] > 0:
+        out["maxAllowedSize"] = meta["maxAllowedSize"]
+    return out
+
+
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
 PASSTHROUGH_BODY_KEYS = {
     "model", "messages", "tools", "tool_choice", "temperature",
@@ -724,12 +751,19 @@ def health():
 def list_models(refresh: int = 0,
                 authorization: Optional[str] = Header(default=None),
                 x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """动态模型列表。默认走缓存（TTL 由 --models-ttl 控制）；?refresh=1 强制重拉。"""
+    """动态模型列表。默认走缓存（TTL 由 --models-ttl 控制）；?refresh=1 强制重拉。
+    每个模型附上下文窗口元数据（max_input_tokens/context_length/max_output_tokens）。"""
     _check_auth(authorization, x_api_key)
-    available, _meta = _catalog().get(force=bool(refresh))
+    available, metas = _catalog().get(force=bool(refresh))
     ids = _model_ids_with_auto(available)
-    data = [{"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
-            for m in ids]
+    by_id = {m.get("id"): m for m in metas if isinstance(m, dict) and m.get("id")}
+    data = []
+    for mid in ids:
+        item = {"id": mid, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
+        meta = by_id.get(_meta_model_id(mid))
+        if meta:
+            item.update(_context_fields(meta))
+        data.append(item)
     return {"object": "list", "data": data}
 
 
@@ -746,12 +780,14 @@ def retrieve_model(model_id: str,
             "error": {"message": f"The model '{model_id}' does not exist",
                       "code": "model_not_found", "type": "invalid_request_error"}})
     item = {"id": model_id, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
-    m = next((x for x in meta if x.get("id") == model_id), None)
+    m = next((x for x in meta if isinstance(x, dict) and x.get("id") == _meta_model_id(model_id)), None)
     if m:
-        # 追加非标准但有用的元数据（OpenAI SDK 客户端会忽略未知字段）
-        for k in ("name", "credits", "maxInputTokens", "maxOutputTokens",
-                  "supportsImages", "supportsToolCall", "vendor"):
-            if k in m:
+        # 上下文窗口（snake_case + vLLM/LM Studio 风格别名）+ 非标准但有用的元数据
+        # （OpenAI SDK 客户端会忽略未知字段）
+        item.update(_context_fields(m, aliases=True))
+        for k in ("name", "credits", "vendor", "onlyReasoning", "supportsReasoning",
+                  "supportsImages", "supportsToolCall", "reasoning", "descriptionZh"):
+            if k in m and m[k] is not None:
                 item[k] = m[k]
     return item
 
