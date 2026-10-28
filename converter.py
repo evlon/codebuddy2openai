@@ -34,6 +34,7 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -49,10 +50,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 try:
-    from desensitize import desensitize_body, escape_user_body, strip_harness_body
+    from desensitize import (desensitize_body, desensitize_tools,
+                             escape_user_body, strip_harness_body)
 except ImportError:  # 模块缺失时降级为不脱敏
     def desensitize_body(body, roles=("system",)):
         return body
+
+    def desensitize_tools(body):
+        return body, 0
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -61,9 +66,9 @@ except ImportError:  # 模块缺失时降级为不脱敏
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 
-# 与官方 CLI 对齐的版本号（当前跟随 @tencent-ai/codebuddy-code 2.171.0，
-# 即本机安装的最新 npm 版本；可用环境变量 UA_VERSION 覆盖）。
-OFFICIAL_VERSION = os.environ.get("CODEBUDDY2OPENAI_UA_VERSION", "2.171.0")
+# 与官方 CLI 对齐的版本号（2026-10-28 官方 2.177.0 抓包实测：npm @tencent-ai/codebuddy-code
+# 2.177.0，UA 形态 `CLI/2.177.0 CodeBuddy/2.177.0`；可用环境变量 UA_VERSION 覆盖）。
+OFFICIAL_VERSION = os.environ.get("CODEBUDDY2OPENAI_UA_VERSION", "2.177.0")
 OFFICIAL_PRODUCT_NAME = "CodeBuddy"
 
 
@@ -194,7 +199,7 @@ class ClientInfoProvider:
             # 1) 官方 CLI 默认值（来自 product.json / 包元数据）
             ci = {
                 "platform": "CLI",
-                "platformVersion": "",
+                "platformVersion": OFFICIAL_VERSION,  # 官方 2.177.0 抓包：platform 与 product 版本一致
                 "productName": OFFICIAL_PRODUCT_NAME,
                 "applicationName": "",
                 "productNameEn": OFFICIAL_PRODUCT_NAME,
@@ -257,42 +262,70 @@ def identity_user_agent(existing: str = "") -> str:
 def _static_identity_headers() -> dict:
     """稳定区身份头（IDE/产品/遥测分段；官方 Ultima 拦截器对所有出站请求带上）。
 
-    精确规则（对照 bundle）：
+    精确规则（对照 bundle + 2026-10-28 官方 2.177.0 抓包）：
       - ClientInfo 侧：X-IDE-Type / X-IDE-Name(=platform) / X-IDE-Version(=platformVersion)
-      - 产品侧：X-Product / X-Product-Version（官方常量表必带，§4 偏差表里此处此前缺失）
+      - 产品侧：X-Product-Version=2.177.0、X-Product="SaaS"（抓包实测；非 productName）
       - 数据隐私：X-Private-Data（官方按企业策略/模型优化开关填，语义见 CONFIG 说明）
+      - 渠道标志：X-Requested-With=XMLHttpRequest、X-CodeBuddy-Request=1、
+        X-Agent-Purpose=conversation（官方每个请求都带，缺失会推高风险分）
     """
     ci = get_client_info().get()
-    return {
+    h = {
         IDE_TYPE_HEADER: ci.get("ideType"),
         IDE_NAME_HEADER: ci.get("platform"),
         IDE_VERSION_HEADER: ci.get("platformVersion") or "0.0.0",
-        PRODUCT_HEADER: ci.get("productName"),
+        PRODUCT_HEADER: os.environ.get("CODEBUDDY2OPENAI_X_PRODUCT", "SaaS"),
         PRODUCT_VERSION_HEADER: ci.get("productVersion"),
         PRIVATE_DATA_HEADER: "true" if CONFIG.get("private_data", True) else "false",
     }
+    # 官方抓包补齐的三个渠道标志头（CODEBUDDY2OPENAI_STATIC_EXTRA=off 可关闭，排查用）
+    if os.environ.get("CODEBUDDY2OPENAI_STATIC_EXTRA", "on") != "off":
+        h["X-Requested-With"] = "XMLHttpRequest"
+        h["X-CodeBuddy-Request"] = "1"
+        h[AGENT_PURPOSE_HEADER] = "conversation"
+    return h
 
 
 def _per_request_identity_headers(model: str = "", conversation_id: str = "") -> dict:
-    """每请求身份头（对照 bundle 9243585 处官方模型请求路径的赋值，逐条一致）：
+    """每请求身份头（对照 bundle + 2026-10-28 官方 2.177.0 抓包，逐条一致）：
 
       X-Request-ID == X-Conversation-Message-ID == randomUUID().replace(/-/g,"")
-      X-Conversation-ID  = 会话 id（官方用 session.id；这里后续每请求生成或客户端透传）
-      X-Conversation-Request-ID = 同 message id（根请求；子代理才分派）
-      X-Agent-Intent = meta["codebuddy.ai/mode"] ?? "craft"
-      X-Agent-Runtime ∈ (local-agent|cloud-agent|agent-agent|other)，默认 local-agent
-      X-Agent-Type = "main"（官方根会话 resolveSessionAgentType → "main"）
+      X-Conversation-Request-ID == X-Root-Request-ID == 独立根 uuid（根会话不变）
+      X-Conversation-ID  = 会话 id（官方 session.id，带连字符；客户端可透传）
+      X-Agent-Intent = "craft"；X-Agent-Runtime = "other"（抓包实测主会话即 other）
+      X-Agent-Type = "main"
+      trace 族：traceparent / b3 / X-B3-* / X-Trace-ID（OpenTelemetry/B3 兼容头，
+                官方经 OpenAI SDK+OTel 发出；trace_id 32hex、span 16hex）
+      baggage = codebuddy.session_id={会话id带连字符},codebuddy.conversation_request_id={根id}
     """
     message_id = uuid.uuid4().hex
+    root_id = uuid.uuid4().hex
+    conv_dashed = conversation_id or str(uuid.uuid4())
+    trace_id = uuid.uuid4().hex
+    span_id = uuid.uuid4().hex[:16]
+    parent_span = uuid.uuid4().hex[:16]
     headers = {
         REQUEST_ID_HEADER: message_id,
         CONVERSATION_MESSAGE_ID_HEADER: message_id,
-        CONVERSATION_REQUEST_ID_HEADER: message_id,
-        CONVERSATION_ID_HEADER: conversation_id or str(uuid.uuid4()),
+        CONVERSATION_REQUEST_ID_HEADER: root_id,
+        ROOT_REQUEST_ID_HEADER: root_id,
+        CONVERSATION_ID_HEADER: conv_dashed,
         AGENT_INTENT_HEADER: os.environ.get("CODEBUDDY2OPENAI_AGENT_INTENT", "craft"),
-        AGENT_RUNTIME_HEADER: os.environ.get("CODEBUDDY2OPENAI_AGENT_RUNTIME", "local-agent"),
+        AGENT_RUNTIME_HEADER: os.environ.get("CODEBUDDY2OPENAI_AGENT_RUNTIME", "other"),
         AGENT_TYPE_HEADER: os.environ.get("CODEBUDDY2OPENAI_AGENT_TYPE", "main"),
     }
+    # 链路追踪（官方 otel/b3 拦截器形态）；CODEBUDDY2OPENAI_TRACE=off 可关闭（排查用）
+    if os.environ.get("CODEBUDDY2OPENAI_TRACE", "on") != "off":
+        headers.update({
+            "traceparent": f"00-{trace_id}-{span_id}-01",
+            "b3": f"{trace_id}-{span_id}-1-{parent_span}",
+            "X-B3-TraceId": trace_id,
+            "X-B3-SpanId": span_id,
+            "X-B3-ParentSpanId": parent_span,
+            "X-B3-Sampled": "1",
+            TRACE_ID_HEADER: trace_id,
+            "baggage": f"codebuddy.session_id={conv_dashed},codebuddy.conversation_request_id={root_id}",
+        })
     if model:
         headers[MODEL_ID_HEADER] = model
     x_api_key = os.environ.get("CODEBUDDY2OPENAI_X_API_KEY", "")
@@ -336,6 +369,7 @@ class CredentialManager:
         self._lock = threading.Lock()
         self._cached: dict | None = None
         self._mtime: float = 0.0
+        self._force_refresh = False
 
     def _read_raw(self) -> dict:
         with open(self.path, "r", encoding="utf-8") as f:
@@ -360,8 +394,15 @@ class CredentialManager:
     def _is_expired(self) -> bool:
         s = self._session()
         expires_at = (s.get("auth") or {}).get("expiresAt") or 0
-        # 提前 60s 判定过期
-        return time.time() * 1000 >= (expires_at - 60_000)
+        remaining = expires_at - time.time() * 1000
+        # 提前 6 小时判定过期：官方 accessToken 28 天 TTL，但后端渠道风险判定比硬过期
+        # 更敏感（陈旧 token 直接推高风险分 → 11128，实测 2026-10-28）。官方客户端自己
+        # 也是常态性刷新，保持令牌新鲜度 = 保持官方形状。
+        return remaining <= 6 * 3600 * 1000
+
+    def force_refresh(self):
+        """外部信号：令牌疑似已被后端降级（如 11128 渠道拦截）。下次 get_headers 强制刷新。"""
+        self._force_refresh = True
 
     def _refresh(self):
         """调后端刷新 token，写回 auth 文件与缓存。"""
@@ -414,10 +455,15 @@ class CredentialManager:
         return h
 
     def get_headers(self) -> dict:
-        """返回带最新 token 的后端请求 header；必要时先刷新。"""
+        """返回带最新 token 的后端请求 header；必要时先刷新。刷新失败不阻塞请求。"""
         with self._lock:
-            if self._is_expired():
-                self._refresh()
+            if self._force_refresh or self._is_expired():
+                try:
+                    self._refresh()
+                except Exception as e:
+                    _log(f"── token 刷新失败（沿用现有 token 继续尝试）：{_truncate(str(e), 120)}")
+                finally:
+                    self._force_refresh = False
             s = self._session()
             return self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
 
@@ -662,9 +708,10 @@ def _apply_sys_prefix(body: dict, mode: str) -> dict:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="codebuddy2openai", version="2.2")
-CONFIG: dict = {"api_key": "", "cred": None, "log_path": None,
+CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "log_keep": 3,
                 "desensitize": False, "catalog": None, "models_ttl": 600.0,
                 "sys_prefix": "off", "user_escape": False, "strip_harness": True,
+                "official_shape": True,
                 # X-Private-Data 的取值（true=数据按隐私处理，禁用于模型优化）。
                 # 官方语义：模型优化开启时发 "false"，关闭/企业策略时发 "true"。
                 # 这里默认 "true"（对应官方"优化关闭/企业保护"的隐私更优侧），
@@ -692,6 +739,73 @@ def _log(msg: str):
                 f.write(line)
     except OSError:
         pass  # 日志失败不应影响主流程
+
+
+# "▶ REQUEST" 的 UTF-8 字节序列：日志里每个请求块以此行开头，
+# 是"一次请求现场"（REQUEST BODY + identity headers + RESPONSE/ERROR）的边界。
+_LOG_REQ_MARKER = "▶ REQUEST".encode("utf-8")
+
+
+def _log_rotate():
+    """日志轮转：只保留最近 N 次请求的现场（CONFIG['log_keep']，默认 3；0=不轮转）。
+
+    在记录新请求前调用。从文件尾部反向扫描第 N 个 `▶ REQUEST` 标记，
+    把它之前的所有内容裁掉——文件里始终只有最近 N 次请求（含进行中的这次），
+    避免日志无限膨胀（实测几天能涨到 2GB+，回查极慢）。
+    采用尾部分块扫描 + 临时文件替换，不整读大文件。
+    """
+    path = CONFIG.get("log_path")
+    keep = CONFIG.get("log_keep")
+    if not path or not keep or int(keep) <= 0:
+        return
+    keep = int(keep)
+    try:
+        with _LOG_LOCK:
+            size = os.path.getsize(path)
+            if size < 256 * 1024:  # 太小不值得重写
+                return
+            # 从尾部倒着找 marker，找到 keep 个即停
+            found: list[int] = []  # 绝对偏移，升序
+            chunk = 4 * 1024 * 1024
+            overlap = len(_LOG_REQ_MARKER) - 1  # 防止 marker 跨块被切开
+            pos = size
+            with open(path, "rb") as f:
+                while pos > 0 and len(found) < keep:
+                    step = min(chunk, pos)
+                    start = pos - step
+                    f.seek(start)
+                    data = f.read(step + (overlap if start > 0 else 0))
+                    hits: list[int] = []
+                    i = 0
+                    while True:
+                        j = data.find(_LOG_REQ_MARKER, i)
+                        if j < 0:
+                            break
+                        hits.append(j + start)
+                        i = j + 1
+                    found = hits + found
+                    pos = start
+                found = sorted(set(found))  # 重叠区可能重复命中同一 marker，去重
+                if len(found) < keep:
+                    return  # 还不够 keep 个请求块，无需裁剪
+                cut = found[-keep]  # 保留最近 keep-1 个完整块 + 即将写入的当前块
+                # 回退到 marker 所在行的行首（保住 "[ts] [rid] " 前缀，行首便于回查）
+                f.seek(max(0, cut - 64))
+                prefix = f.read(min(64, cut))
+                nl = prefix.rfind(b"\n")
+                if nl >= 0:
+                    cut = cut - len(prefix) + nl + 1
+                f.seek(cut)
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as out:
+                    while True:
+                        b = f.read(8 * 1024 * 1024)
+                        if not b:
+                            break
+                        out.write(b)
+            os.replace(tmp, path)  # 原子替换
+    except OSError:
+        pass  # 轮转失败不影响主流程
 
 
 
@@ -819,6 +933,24 @@ async def chat_completions(request: Request,
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
 
+    # 官方请求形状补齐（默认开，--official-shape off 关闭；2026-10-28 官方 2.177.0 抓包对齐）：
+    # - extra_vars.harnessMetadata：官方客户端必带的 JSON 串（harnessVersion/stepIndex/
+    #   contextWindowId/agent.depth），缺失属于"非官方客户端"特征，推高渠道风险分；
+    # - reasoning_effort/verbosity/cache_retention/reasoning_summary：官方默认值，
+    #   客户端显式指定时不覆盖。
+    if CONFIG.get("official_shape", True):
+        if "extra_vars" not in body:
+            body["extra_vars"] = {
+                "harnessMetadata": json.dumps(
+                    {"schemaVersion": 1, "harnessVersion": OFFICIAL_VERSION, "stepIndex": 0,
+                     "contextWindowId": str(uuid.uuid4()), "agent": {"depth": 0}},
+                    separators=(",", ":")),
+                "initiator": "user",
+            }
+        for _k, _v in (("reasoning_effort", "high"), ("verbosity", "high"),
+                       ("cache_retention", "long"), ("reasoning_summary", "auto")):
+            body.setdefault(_k, _v)
+
     # strip-harness（默认开）：清洗 system 里的 DeepSeek Harness 签名（11128 拦截源）
     if CONFIG.get("strip_harness", True):
         body, harness_count = strip_harness_body(body)
@@ -840,15 +972,25 @@ async def chat_completions(request: Request,
              f"（{len(OFFICIAL_SYS_HEADER) if sys_prefix == 'short' else len(OFFICIAL_SYS_HEADER) + len(OFFICIAL_SYS_POLICY) + 2} 字符）")
 
     # 可选：脱敏。缓解客户端合规模板（如 ZCode 的 system 声明）被后端误判为敏感词。
-    # 只对 system 角色消息里的"合规声明高频词"插入零宽空格，不改用户输入。
+    # 默认只对 system 角色消息里的"合规声明高频词"插入零宽空格，不改用户输入。
+    # --desensitize-scope all 时扩展到 user/assistant/tool 消息与 tools 描述
+    # （dsh 客户端的工具描述/笔记里的 dsh/DSH 痕迹是渠道风险分加重因子）。
     if CONFIG.get("desensitize"):
-        body = desensitize_body(body, roles=("system",))
+        scope = CONFIG.get("desensitize_scope", "system")
+        if scope == "all":
+            body = desensitize_body(body, roles=("system", "user", "assistant", "tool"))
+            body, dsc = desensitize_tools(body)
+            _log(f"[{rid}] ── desensitize(scope=all): 全角色 + tools 描述"
+                 + (f"，tools 改写 {dsc} 处" if dsc else ""))
+        else:
+            body = desensitize_body(body, roles=("system",))
 
     # 日志：请求摘要
     model_name = payload.get("model", "auto")
     tool_names = [t.get("function", {}).get("name") for t in (payload.get("tools") or [])
                   if isinstance(t, dict)]
     last_user = _last_user_text(messages)
+    _log_rotate()  # 记录新请求前先裁掉更早的请求现场（保留最近 log_keep 次）
     _log(f"[{rid}] ▶ REQUEST {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
          + (f" | tools={tool_names}" if tool_names else "")
          + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
@@ -860,7 +1002,14 @@ async def chat_completions(request: Request,
     # - 优先复用客户端透传的 X-Conversation-ID，便于多轮客户端与服务端日志按会话关联；
     #   客户端未携带则每次生成一个（官方对"新会话"的语义等同）。
     client_conversation_id = request.headers.get("x-conversation-id", "")
-    headers.update(_per_request_identity_headers(model_name, client_conversation_id))
+
+    def build_fresh_headers() -> dict:
+        """组装完整后端头（令牌头 + 静态身份面 + 每请求身份/trace 面）。"""
+        h = cred.get_headers()
+        h.update(_per_request_identity_headers(model_name, client_conversation_id))
+        return h
+
+    headers = build_fresh_headers()
     _log(f"[{rid}] ── identity headers: conv={headers.get(CONVERSATION_ID_HEADER)} "
          f"req={headers.get(REQUEST_ID_HEADER)} ide={headers.get(IDE_TYPE_HEADER)}")
     url = f"{BACKEND}/v2/chat/completions"
@@ -868,26 +1017,37 @@ async def chat_completions(request: Request,
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_upstream(url, headers, body, model_name, t0, rid),
+            _stream_upstream(url, headers, body, model_name, t0, rid,
+                             cred=cred, build_headers=build_fresh_headers),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
-    try:
-        async with httpx.AsyncClient(timeout=300) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    raw = await r.aread()
-                    _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
-                    _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8','replace')}")
-                    raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
-                collected = await _collect_stream(r)
-    except HTTPException:
-        raise
-    except httpx.HTTPError as e:
-        _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
-        raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+    # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应。
+    # 11128 自愈：渠道拦截时强刷令牌 + 换身份头重试一次（重试轰炸推高后端渠道热度）。
+    collected = None
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=300) as c:
+                async with c.stream("POST", url, headers=headers, json=body) as r:
+                    if r.status_code != 200:
+                        raw = await r.aread()
+                        _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
+                        _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8','replace')}")
+                        if attempt == 1 and b"11128" in raw:
+                            _log(f"[{rid}] ── 11128 渠道拦截：强刷令牌+换身份头，2s 后重试一次")
+                            await asyncio.sleep(2)
+                            cred.force_refresh()
+                            headers = build_fresh_headers()
+                            continue
+                        raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
+                    collected = await _collect_stream(r)
+        except HTTPException:
+            raise
+        except httpx.HTTPError as e:
+            _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
+            raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+        break
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
 
@@ -1008,11 +1168,15 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
 
 
 async def _stream_upstream(url: str, headers: dict, body: dict,
-                           model_name: str = "?", t0: float = 0.0, rid: str = ""):
+                           model_name: str = "?", t0: float = 0.0, rid: str = "",
+                           cred=None, build_headers=None):
     """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
 
     同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
     完整原始 SSE 累积后落盘到日志（调试用）。
+
+    11128 自愈：渠道拦截时强刷令牌并换新身份头重试一次（重试轰炸会推高后端
+    渠道热度，故只重试一次、间隔 2s）。
     """
     finish_reason = None
     tool_names: list[str] = []
@@ -1056,19 +1220,26 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                 saw_filter = True
 
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err = await r.aread()
-                    _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
-                    _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8','replace')}")
-                    yield _err_event(err, r.status_code)
-                    return
-                async for chunk in r.aiter_bytes():
-                    if chunk:
-                        raw_parts.append(chunk)
-                        _feed(chunk)
-                        yield chunk
+        for attempt in (1, 2):
+            async with httpx.AsyncClient(timeout=None) as c:
+                async with c.stream("POST", url, headers=headers, json=body) as r:
+                    if r.status_code != 200:
+                        err = await r.aread()
+                        _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
+                        _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8','replace')}")
+                        if attempt == 1 and cred is not None and b"11128" in err:
+                            _log(f"{prefix}── 11128 渠道拦截：强刷令牌+换身份头，2s 后重试一次")
+                            await asyncio.sleep(2)
+                            cred.force_refresh()
+                            headers = build_headers() if build_headers else headers
+                            continue
+                        yield _err_event(err, r.status_code)
+                        return
+                    async for chunk in r.aiter_bytes():
+                        if chunk:
+                            raw_parts.append(chunk)
+                            _feed(chunk)
+                            yield chunk
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
@@ -1148,6 +1319,10 @@ def main():
     ap.add_argument("--log", default=None, metavar="PATH",
                     help="开启日志并写到该文件（如 --log converter.log 或 --log /tmp/cb.log）。"
                          "不传则不记日志。")
+    ap.add_argument("--log-keep", type=int,
+                    default=int(os.environ.get("CODEBUDDY2OPENAI_LOG_KEEP", 3)),
+                    help="日志轮转：文件里只保留最近 N 次请求的完整现场（默认 3，0=不轮转、"
+                         "一直追加）。避免日志无限膨胀。")
     ap.add_argument("--desensitize", action="store_true",
                     help="启用脱敏：对 system 消息里的合规模板敏感词（DoS/exploit/credential 等）"
                          "插入零宽空格，缓解被后端内容审核误拦。默认关闭。")
@@ -1177,6 +1352,22 @@ def main():
                          "web-surface 三段，后端 11128 渠道拦截的匹配源）。默认 on：任何客户端漏出的"
                          "签名在出站前统一清洗（幂等，与 dsh CodeBuddy 预设的遮蔽互不冲突）。"
                          "也可用环境变量 CODEBUDDY2OPENAI_STRIP_HARNESS=off 关闭。")
+    ap.add_argument("--official-shape", default=os.environ.get("CODEBUDDY2OPENAI_OFFICIAL_SHAPE", "on"),
+                    choices=["on", "off"],
+                    help="官方请求形状补齐（默认 on；2026-10-28 官方 2.177.0 抓包对齐）：body 补"
+                         "extra_vars.harnessMetadata/initiator 与 reasoning_effort/verbosity/"
+                         "cache_retention/reasoning_summary 官方默认值；缺这些字段会被后端视为"
+                         "非官方客户端、推高渠道风险分（11128）。客户端显式指定时不覆盖。"
+                         "也可用环境变量 CODEBUDDY2OPENAI_OFFICIAL_SHAPE=off 关闭。")
+    ap.add_argument("--desensitize-scope",
+                    default=os.environ.get("CODEBUDDY2OPENAI_DESENSITIZE_SCOPE", "system"),
+                    choices=["system", "all"],
+                    help="脱敏作用范围（需 --desensitize 开启）。默认 system：只打散 system"
+                         " 消息里的敏感词。all：扩展到 user/assistant/tool 消息与 tools 描述"
+                         "——dsh 客户端的工具描述/用户笔记里的 dsh/DSH 痕迹是渠道风险分的"
+                         "加重因子，全量打散用于压低整条请求的风险分（响应里模型可能回显"
+                         "零宽字符，可见但无害）。也可用环境变量"
+                         " CODEBUDDY2OPENAI_DESENSITIZE_SCOPE=all。")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     args = ap.parse_args()
 
@@ -1186,8 +1377,11 @@ def main():
     CONFIG["sys_prefix"] = args.sys_prefix
     CONFIG["user_escape"] = bool(args.user_escape)
     CONFIG["strip_harness"] = args.strip_harness == "on"
+    CONFIG["official_shape"] = args.official_shape == "on"
+    CONFIG["desensitize_scope"] = args.desensitize_scope
     # --log 直接指定文件路径即开启；不传则不记
     CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
+    CONFIG["log_keep"] = max(0, int(args.log_keep))
     af = find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None
     CONFIG["models_ttl"] = args.models_ttl
@@ -1205,7 +1399,8 @@ def main():
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
     if CONFIG["log_path"]:
-        sys.stderr.write(f"   日志      : {CONFIG['log_path']}\n")
+        keep_note = f"（保留最近 {CONFIG['log_keep']} 次请求）" if CONFIG["log_keep"] else "（不轮转）"
+        sys.stderr.write(f"   日志      : {CONFIG['log_path']}{keep_note}\n")
     if args.desensitize:
         sys.stderr.write("   脱敏      : 已启用（system 合规词零宽处理）\n")
     if CONFIG["sys_prefix"] != "off":
