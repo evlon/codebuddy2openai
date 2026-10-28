@@ -788,7 +788,9 @@ def _log_rotate():
                 found = sorted(set(found))  # 重叠区可能重复命中同一 marker，去重
                 if len(found) < keep:
                     return  # 还不够 keep 个请求块，无需裁剪
-                cut = found[-keep]  # 保留最近 keep-1 个完整块 + 即将写入的当前块
+                # 保留最近 keep-1 个完整块 + 即将写入的当前块（合计 keep）：
+                # 裁到倒数第 keep-1 个 marker 处；keep=1 时清空（文件只剩当前请求）。
+                cut = found[-(keep - 1)] if keep > 1 else size
                 # 回退到 marker 所在行的行首（保住 "[ts] [rid] " 前缀，行首便于回查）
                 f.seek(max(0, cut - 64))
                 prefix = f.read(min(64, cut))
