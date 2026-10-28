@@ -381,6 +381,21 @@ _WEB_SURFACE_NEUTRAL = (
 # 残兜底：还有任何 "DeepSeek Harness" 变体字面量 → 换成 "CodeBuddy"（语义无害）。
 _HARNESS_RESIDUAL_RE = re.compile(r"Deep[ \t]*Seek[ \t]+Harness", re.IGNORECASE)
 
+# @-路径语义段（2026-10-28 确定性定位）：dsh 预设里"Tokens prefixed with @ ..."
+# 一段是后端渠道拦截的又一个硬字面量源（官方载体 + 该段整段移除/改写即放行，
+# 原文 2/2 稳定被拦；预设其余部分分块扫描全部放行）。改为中性等效改写。
+_HARNESS_ATPATH_RE = re.compile(
+    r"Tokens prefixed with @ are paths the user explicitly referenced\..*?"
+    r"quotes a path containing spaces\.",
+    re.S,
+)
+_ATPATH_NEUTRAL = (
+    "File paths that the user prefixed with the at sign resolve relative to the "
+    "workspace root; absolute paths point to host files or directories. A trailing "
+    "slash marks a directory; otherwise treat it as a file and read it before "
+    "claiming to have inspected it. Quoted at-paths wrap paths containing spaces."
+)
+
 
 def strip_harness_text(text: str) -> tuple[str, int]:
     """清洗一段 system 文本里的 DeepSeek Harness 签名。返回 (新文本, 改写数)。"""
@@ -396,6 +411,7 @@ def strip_harness_text(text: str) -> tuple[str, int]:
     out = _sub(_HARNESS_IDENTITY_RE, "You are CodeBuddy Code.", out)
     out = _sub(_HARNESS_SOURCE_RE, "", out)
     out = _sub(_HARNESS_WEB_RE, _WEB_SURFACE_NEUTRAL, out)
+    out = _sub(_HARNESS_ATPATH_RE, _ATPATH_NEUTRAL, out)
     out = _sub(_HARNESS_RESIDUAL_RE, "CodeBuddy", out)
     return out, count
 
