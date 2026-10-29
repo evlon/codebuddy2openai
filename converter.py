@@ -1089,10 +1089,90 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
     _log(f"{prefix}── RESPONSE BODY ──\n{json.dumps(result, ensure_ascii=False, indent=2)}")
 
 
+def _scrub_zwsp(s: str) -> str:
+    """去掉零宽空格 U+200B。
+
+    来源：--desensitize 打码会在请求里把 dsh/deepseek 等敏感词变成带 U+200B 的
+    拼写（d\\u200bsh），模型会照抄这种"看起来像原词"的拼写进自己的输出
+    （正文、todos、shell 命令、标识符都有实例），零宽字符跟着落到 UI/文件/命令行。
+    因此在响应侧把 U+200B 统一洗掉（详见 README「零宽字符」FAQ）。
+    """
+    return s.replace("\u200b", "") if isinstance(s, str) else s
+
+
+def _scrub_strings_deep(obj):
+    """递归清洗 dict/list 结构内所有字符串值里的 U+200B（原对象就地修改）。"""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str):
+                obj[k] = _scrub_zwsp(v)
+            else:
+                _scrub_strings_deep(v)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            if isinstance(v, str):
+                obj[i] = _scrub_zwsp(v)
+            else:
+                _scrub_strings_deep(v)
+    return obj
+
+
+class _SSEScrubber:
+    """上游 SSE 逐行解析器 + 零宽字符清洗器 + 输出重序列化器（三合一）。
+
+    - 把字节流按行切分（缓冲不完整行），data: 行解出 JSON → 递归清洗 U+200B →
+      用 json.dumps 重新序列化再发给客户端；[DONE] 原样透传；非 data 行原样透传。
+    - 解析成功一个 data 行时回调 on_json（用于统计 usage / finish_reason / 工具名）。
+    - 结构异常的 data 行（解不出 JSON）保留原样转发，不影响流的连续性。
+    """
+
+    def __init__(self, on_json=None):
+        self.buf = b""
+        self._on_json = on_json
+
+    def feed(self, chunk: bytes) -> bytes:
+        """喂一段上游字节，返回可立即发给客户端的清洗后字节（可能为空）。"""
+        out = bytearray()
+        self.buf += chunk
+        while True:
+            nl = self.buf.find(b"\n")
+            if nl < 0:
+                break
+            line = self.buf[:nl]
+            self.buf = self.buf[nl + 1:]
+            out += self._handle_line(line)
+        return bytes(out)
+
+    def flush(self) -> bytes:
+        """流末尾冲洗缓冲里没有换行结尾的残余行。"""
+        rest, self.buf = self.buf, b""
+        return self._handle_line(rest) if rest else b""
+
+    def _handle_line(self, line: bytes) -> bytes:
+        if line.startswith(b"data:"):
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                return b"data: [DONE]\n"
+            try:
+                obj = json.loads(data)
+            except Exception:
+                return line + b"\n"
+            if callable(self._on_json):
+                try:
+                    self._on_json(obj)
+                except Exception:
+                    pass
+            _scrub_strings_deep(obj)
+            return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+        # 非数据行（event:/注释/空行等）原样透传
+        return line + b"\n"
+
+
 async def _collect_stream(response: httpx.Response) -> dict:
     """消费后端的 OpenAI SSE 流，聚合成单个非流式 chat.completion 对象。
 
     合并所有 chunk 的 delta（content / tool_calls），并取 usage / finish_reason。
+    每个 delta 片段进入聚合前先洗掉 U+200B（模型回声，见 _scrub_zwsp）。
     """
     content_parts: list[str] = []
     reasoning_parts: list[str] = []   # 思考流（后端 glm/kimi 等会下发 reasoning_content）
@@ -1121,9 +1201,9 @@ async def _collect_stream(response: httpx.Response) -> dict:
                 finish_reason = choice["finish_reason"]
             delta = choice.get("delta") or {}
             if delta.get("content"):
-                content_parts.append(delta["content"])
+                content_parts.append(_scrub_zwsp(delta["content"]))
             if delta.get("reasoning_content"):
-                reasoning_parts.append(delta["reasoning_content"])
+                reasoning_parts.append(_scrub_zwsp(delta["reasoning_content"]))
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 slot = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
@@ -1131,9 +1211,9 @@ async def _collect_stream(response: httpx.Response) -> dict:
                     slot["id"] = tc["id"]
                 fn = tc.get("function") or {}
                 if fn.get("name"):
-                    slot["name"] = fn["name"]
+                    slot["name"] = _scrub_zwsp(fn["name"])
                 if fn.get("arguments"):
-                    slot["arguments"] += fn["arguments"]
+                    slot["arguments"] += _scrub_zwsp(fn["arguments"])
 
     tcs = None
     if tool_calls:
@@ -1172,10 +1252,12 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
 async def _stream_upstream(url: str, headers: dict, body: dict,
                            model_name: str = "?", t0: float = 0.0, rid: str = "",
                            cred=None, build_headers=None):
-    """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
+    """把后端 SSE 逐行解析、清洗 U+200B 后重新序列化转发给客户端。
 
-    同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
-    完整原始 SSE 累积后落盘到日志（调试用）。
+    后端已是标准 OpenAI SSE（含 tool_calls）；上游 data 行解出 JSON → 递归洗掉
+    U+200B（--desensitize 打码的拼写会被模型回声进输出，见 README 零宽字符 FAQ）
+    → 重序列化发给客户端；[DONE] 与非数据行原样透传。清洗后的完整 SSE 落盘日志。
+    一个 data 行内的 JSON 是完整值，因此 ZWSP 不会跨行漏洗。
 
     11128 自愈：渠道拦截时强刷令牌并换新身份头重试一次（重试轰炸会推高后端
     渠道热度，故只重试一次、间隔 2s）。
@@ -1184,42 +1266,29 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
     tool_names: list[str] = []
     usage: dict = {}
     saw_filter = False
-    buf = b""
-    raw_parts: list[bytes] = []   # 累积完整原始 SSE
+    raw_parts: list[bytes] = []   # 累积清洗后发给客户端的完整 SSE
     prefix = f"[{rid}] " if rid else ""
 
-    def _feed(chunk: bytes):
-        nonlocal finish_reason, saw_filter, buf
-        # 行缓冲解析：把累计的 chunk 按 data: 行切出来统计
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            line = line.strip()
-            if not line.startswith(b"data:"):
-                continue
-            data = line[5:].strip()
-            if data == b"[DONE]":
-                continue
-            try:
-                obj = json.loads(data)
-            except Exception:
-                continue
-            if obj.get("usage"):
-                usage.update(obj["usage"])
-            for ch in obj.get("choices") or []:
-                if ch.get("finish_reason"):
-                    finish_reason = ch["finish_reason"]
-                for tc in (ch.get("delta") or {}).get("tool_calls") or []:
-                    nm = (tc.get("function") or {}).get("name")
-                    if nm:
-                        tool_names.append(nm)
-            # 内容审核拦截常以 content-filter 或特殊中文文案返回
-            try:
-                text_repr = data.decode("utf-8", "replace")
-            except Exception:
-                text_repr = ""
-            if "content-filter" in text_repr or "敏感" in text_repr or "审核" in text_repr:
-                saw_filter = True
+    def _stats(obj):
+        nonlocal finish_reason, saw_filter
+        if obj.get("usage"):
+            usage.update(obj["usage"])
+        for ch in obj.get("choices") or []:
+            if ch.get("finish_reason"):
+                finish_reason = ch["finish_reason"]
+            for tc in (ch.get("delta") or {}).get("tool_calls") or []:
+                nm = (tc.get("function") or {}).get("name")
+                if nm:
+                    tool_names.append(nm)
+        # 内容审核拦截常以 content-filter 或特殊中文文案返回
+        try:
+            text_repr = json.dumps(obj, ensure_ascii=False)
+        except Exception:
+            text_repr = ""
+        if "content-filter" in text_repr or "敏感" in text_repr or "审核" in text_repr:
+            saw_filter = True
+
+    scrubber = _SSEScrubber(on_json=_stats)
 
     try:
         for attempt in (1, 2):
@@ -1239,9 +1308,14 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                         return
                     async for chunk in r.aiter_bytes():
                         if chunk:
-                            raw_parts.append(chunk)
-                            _feed(chunk)
-                            yield chunk
+                            out = scrubber.feed(chunk)
+                            if out:
+                                raw_parts.append(out)
+                                yield out
+                    tail = scrubber.flush()
+                    if tail:
+                        raw_parts.append(tail)
+                        yield tail
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
@@ -1252,7 +1326,7 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
     _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | stream finish={finish_reason}{tag}"
          + (f" | tool_calls={tool_names}" if tool_names else "")
          + f" | tokens={usage.get('total_tokens', '?')}")
-    # 完整原始 SSE（后端返回的全部内容）
+    # 清洗后发给客户端的完整 SSE
     _log(f"{prefix}── RESPONSE RAW SSE ──\n{b''.join(raw_parts).decode('utf-8','replace')}")
 
 

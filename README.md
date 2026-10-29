@@ -254,6 +254,7 @@ codebuddy -p "Reply exactly: ok"
     3. **热度层**：**每次 11128 都会推高账户热度、降低后续阈值**（连续被拦会升级到连正常请求也被拦；衰减以十分钟计，短时间静默不够）。被拦后不要高频重试——转换器内置的 11128 处理是"强刷令牌 + 2s 后重试一次"即止，就是这个原因。
   应对：①`--log xxx.log` 看日志定位；②确认 `--strip-harness` 开着；③dsh 用户加 `--desensitize --desensitize-scope all` 打散全部 dsh/DSH 痕迹；④保持转换器新版（官方形状 + 令牌保鲜都在）。若整条会话已把账户热度打高，等十几分钟或跑一次官方 CLI 再试。注意：脱敏只针对客户端固定模板与产品名痕迹，不能也不应绕过对用户真实有害输入的审核。
 另可用 `--sys-prefix full` 在 system 最上方注入官方 CLI 的提示词关键字（`You are CodeBuddy Code.` + 角色 + `<content_policy>`），让 agent 客户端的 system 贴近官方会话形态；它不是准入条件（实测无 system 声明也能过），属可选的"形态对齐 + 合规复用"。
+- **输出里出现零宽字符 U+200B（隐形字符混进正文/命令/文件名）**：这是 `--desensitize` 打码的副作用 + 模型回声的组合。脱敏会把 `dsh`/`deepseek` 等敏感词变成 `d​sh`（词中间夹 U+200B）的拼写发给模型；模型读到这种"长得像原词"的怪拼写后，会**照抄进自己的输出**——实测（2026-10-29）回声出现在正文、todos、shell 命令（`npm i d​sh-pkg`）、甚至标识符（`d​shHome`）里，零宽字符随之落进 UI/终端/文件。转换器响应侧已内置清洗：流式与非流式路径都会在返回客户端前把 U+200B 洗掉（模型回声进上下文的自 reinforcing 循环也随之断掉）。若想从源头减量，可回退 `--desensitize-scope all` → `system`（工具描述不打码；是否影响 11128 需以实测为准）。
 - **user 提示词里的敏感词被拦**：与上面 system 误拦同理，但发生在用户真实输入上（如 "explain phishing"）。两种配套：① `--desensitize` 只处理 system，管不到 user；② `--user-escape` 把命中词表的术语包成 `[s[<逐字反转>]]`（`phishing` → `[s[gnihsihp]]`），并在 system 无解码说明时自动补 `CODEBUDDY_ESCAPE_CODEC` 解码段；模型解码还义实测正常（`[s[gnihsihp]]`→phishing、`[s[gnikcah]]`→hacking）。dsh 用户建议直接用上面的 CodeBuddy 预设：解码段常驻 system，转换器只负责转义、不会重复注入。
 
 ### ⚠️ 免责声明
