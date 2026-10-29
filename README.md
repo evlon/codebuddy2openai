@@ -161,7 +161,7 @@ python3 converter.py [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [-
 | `--log` | 无 | **开启日志并写到该文件**（如 `--log converter.log`）。不传则不记。也可用环境变量 `CODEBUDDY2OPENAI_LOG`。|
 | `--log-keep` | `3` | 日志自动裁剪：日志里只保留最近 N 次请求的完整现场（含报文），旧的在写入新请求前删除。日志不会无限增长，也避免敏感报文长期落盘。`0`=关闭裁剪（保留全部）。也可用环境变量 `CODEBUDDY2OPENAI_LOG_KEEP`。|
 | `--desensitize` | 关 | 启用脱敏：对消息文本里的合规声明敏感词（DoS/exploit/credential/C2 等）与渠道风险痕迹词（`dsh`/`deepseek`/`DeepSeek Harness`）插入零宽空格，打断后端的关键词/字面量匹配（见下方 FAQ）。默认只处理 system 角色。|
-| `--desensitize-scope` | `system` | 脱敏作用范围（需 `--desensitize`）。`system`=只处理 system 消息；`all`=扩展到 user/assistant/tool 消息与 `tools` 描述——dsh 客户端的工具描述/用户笔记里的 `dsh`/`DSH_*` 痕迹是渠道风险分的加重因子（实测 2026-10-28：真实会话 71 处痕迹可打散 68 处），整条请求被 `11128` 拦截时建议 `all`。也可用环境变量 `CODEBUDDY2OPENAI_DESENSITIZE_SCOPE`。|
+| `--desensitize-scope` | `system` | 脱敏作用范围（需 `--desensitize`）。`system`=只处理 system 消息；`all`=扩展到 user/assistant/tool 消息与 `tools` 描述（2026-10-28 曾实测 71 处痕迹可打散 68 处）。**2026-10-29 实测后建议保持默认 `system`**：确认确定性硬拦点全在 system 预设里（签名 + @-路径段，由 strip-harness 改写），FULL replay 不打工具/用户痕迹也能全量放行；`all` 仅作为旁路备份（若哪天风控重新把工具痕迹计入评分再启用）。也可用环境变量 `CODEBUDDY2OPENAI_DESENSITIZE_SCOPE`。|
 | `--user-escape` | 关 | 启用**用户消息转义**：user 角色消息里命中词表（phishing/exploit/hack 等）的英文术语包成 `[s[<逐字反转>]]`（`phishing` → `[s[gnihsihp]]`）打断后端关键词匹配；若 system 里尚无解码说明还会自动补一段 `CODEBUDDY_ESCAPE_CODEC` 解码说明，模型自行反转还义。与 CodeBuddy 预设（见下）配对时解码说明由预设提供，不重复注入。也可用环境变量 `CODEBUDDY2OPENAI_USER_ESCAPE`。|
 | `--strip-harness` | `on` | **签名清洗（默认开）**：清洗 system 消息里 dsh 客户端的三段全局签名（`harness:identity` / `harness:source` / `app:web-surface`，均含字面量 `DeepSeek Harness`——后端 `11128` 渠道拦截的匹配源）、**@-路径语义段**（`Tokens prefixed with @ … quotes a path containing spaces.` 整段，2026-10-28 官方载体分块扫描确定性定位的第二处硬拦点，改为语义等效的中性改写），**并清洗 assistant 历史消息里的残留签名**（模型在 dsh persona 时期的自我介绍会存进会话历史，续聊回放照样触发 11128，实测 2026-10-28）。identity 改写为 `You are CodeBuddy Code.`，source 删除，web-surface 替换为中性等效文本；残留变体字面量兜底替换为 `CodeBuddy`。幂等，与 dsh CodeBuddy 预设的遮蔽互不冲突（双层防护）。`--strip-harness off`（或环境变量 `CODEBUDDY2OPENAI_STRIP_HARNESS=off`）可关。|
 | `--official-shape` | `on` | **官方请求形状补齐（默认开）**：body 里补官方客户端必带字段——`extra_vars.harnessMetadata`（`harnessVersion`/`stepIndex`/`contextWindowId`/`agent.depth` 的 JSON 串，2026-10-28 官方 2.177.0 抓包逐字对齐）与 `reasoning_effort`/`verbosity`/`cache_retention`/`reasoning_summary` 官方默认值。缺这些字段会被后端视为非官方客户端、推高渠道风险分。客户端显式指定时不覆盖。`--official-shape off`（或环境变量 `CODEBUDDY2OPENAI_OFFICIAL_SHAPE=off`）可关。|
@@ -227,9 +227,10 @@ dsh plugin --profile web add "file:E:/ai-works/codebuddy2openai/dsh-codebuddy"
 配套启动方式（身份由预设承担，转换器**不要**再加 `--sys-prefix`，避免重复）:
 
 ```bash
-python converter.py --port 8787 --log converter.log --user-escape --desensitize --desensitize-scope all
+python converter.py --port 8787 --log converter.log --user-escape --desensitize --desensitize-scope system
 # strip-harness 默认开启（system+assistant 签名清洗兜底）；不想清签名：--strip-harness off
-# --desensitize-scope all 会把 dsh/DSH 痕迹一并打散（含工具描述），压低整条请求的渠道风险分
+# scope=system（默认值）：只打散 system 预设痕迹。2026-10-29 实测工具/用户不打码也能过风控，
+# 且避免模型把零宽字符回声进输出（见 FAQ 零宽字符条目）
 ```
 
 ### 📡 官方请求抓包（capture_server.py）
@@ -250,11 +251,11 @@ codebuddy -p "Reply exactly: ok"
 - **响应慢**：可换 `deepseek-v4-flash` 等更快的模型。
 - **"敏感内容"被拦截 / `11128 Illegal API invocation from an unapproved channel`**：CodeBuddy 后端在模型推理之前做渠道风控 + 内容审核。实测（2026-10-21 与 2026-10-28 两轮）机制为**动态累计评分**，不是单一静态字面量：
     1. **字面量层（确定性）**：system/assistant 历史里的精确串 `DeepSeek Harness`（dsh 客户端签名），以及 dsh 预设里的 @-路径语义段（`Tokens prefixed with @ …`）是确定的匹配源（官方载体分块扫描逐块验证，只有这两类内容被拦，其余预设文本全部放行）→ `--strip-harness`（默认开）清洗/改写；
-    2. **评分层**：外来 prompt 痕迹（dsh 预设文本、工具描述/用户笔记里的 `dsh`/`DSH_*`）与客户端形态偏离（缺官方头/官方 body 字段/陈旧令牌）累计推高风险分，突破阈值即整条请求被拦；
+    2. **评分层**：外来 prompt 痕迹（dsh 预设文本、工具描述/用户笔记里的 `dsh`/`DSH_*`）与客户端形态偏离（缺官方头/官方 body 字段/陈旧令牌）累计推高风险分，突破阈值即整条请求被拦；**2026-10-29 复测：两层确定性硬拦点（`DeepSeek Harness` 签名 + @-路径段）被 `--strip-harness` 改写后，工具描述/用户消息完全不打码（`--desensitize-scope system`）也能全量放行**（真实被拦流量 41 消息 + 66 工具 FULL replay 一次通过，`finish=stop`）；
     3. **热度层**：**每次 11128 都会推高账户热度、降低后续阈值**（连续被拦会升级到连正常请求也被拦；衰减以十分钟计，短时间静默不够）。被拦后不要高频重试——转换器内置的 11128 处理是"强刷令牌 + 2s 后重试一次"即止，就是这个原因。
-  应对：①`--log xxx.log` 看日志定位；②确认 `--strip-harness` 开着；③dsh 用户加 `--desensitize --desensitize-scope all` 打散全部 dsh/DSH 痕迹；④保持转换器新版（官方形状 + 令牌保鲜都在）。若整条会话已把账户热度打高，等十几分钟或跑一次官方 CLI 再试。注意：脱敏只针对客户端固定模板与产品名痕迹，不能也不应绕过对用户真实有害输入的审核。
+  应对：①`--log xxx.log` 看日志定位；②确认 `--strip-harness` 开着；③dsh 用户 `--desensitize`（默认 scope=system 即可，2026-10-29 实测工具/用户不打码也能过；若再度被拦再试 `--desensitize-scope all`）；④保持转换器新版（官方形状 + 令牌保鲜都在）。若整条会话已把账户热度打高，等十几分钟或跑一次官方 CLI 再试。注意：脱敏只针对客户端固定模板与产品名痕迹，不能也不应绕过对用户真实有害输入的审核。
 另可用 `--sys-prefix full` 在 system 最上方注入官方 CLI 的提示词关键字（`You are CodeBuddy Code.` + 角色 + `<content_policy>`），让 agent 客户端的 system 贴近官方会话形态；它不是准入条件（实测无 system 声明也能过），属可选的"形态对齐 + 合规复用"。
-- **输出里出现零宽字符 U+200B（隐形字符混进正文/命令/文件名）**：这是 `--desensitize` 打码的副作用 + 模型回声的组合。脱敏会把 `dsh`/`deepseek` 等敏感词变成 `d​sh`（词中间夹 U+200B）的拼写发给模型；模型读到这种"长得像原词"的怪拼写后，会**照抄进自己的输出**——实测（2026-10-29）回声出现在正文、todos、shell 命令（`npm i d​sh-pkg`）、甚至标识符（`d​shHome`）里，零宽字符随之落进 UI/终端/文件。转换器响应侧已内置清洗：流式与非流式路径都会在返回客户端前把 U+200B 洗掉（模型回声进上下文的自 reinforcing 循环也随之断掉）。若想从源头减量，可回退 `--desensitize-scope all` → `system`（工具描述不打码；是否影响 11128 需以实测为准）。
+- **输出里出现零宽字符 U+200B（隐形字符混进正文/命令/文件名）**：这是 `--desensitize` 打码的副作用 + 模型回声的组合。脱敏会把 `dsh`/`deepseek` 等敏感词变成 `d​sh`（词中间夹 U+200B）的拼写发给模型；模型读到这种"长得像原词"的怪拼写后，会**照抄进自己的输出**——实测（2026-10-29）回声出现在正文、todos、shell 命令（`npm i d​sh-pkg`）、甚至标识符（`d​shHome`）里，零宽字符随之落进 UI/终端/文件。转换器响应侧已内置清洗：流式与非流式路径都会在返回客户端前把 U+200B 洗掉（模型回声进上下文的自强环也随之中断）。源头减量：`--desensitize-scope` 一律用默认 `system`（2026-10-29 FULL replay 实测工具/用户不打码也能过风控，不必用 `all` 把 66 个工具描述灌满零宽字符）。
 - **user 提示词里的敏感词被拦**：与上面 system 误拦同理，但发生在用户真实输入上（如 "explain phishing"）。两种配套：① `--desensitize` 只处理 system，管不到 user；② `--user-escape` 把命中词表的术语包成 `[s[<逐字反转>]]`（`phishing` → `[s[gnihsihp]]`），并在 system 无解码说明时自动补 `CODEBUDDY_ESCAPE_CODEC` 解码段；模型解码还义实测正常（`[s[gnihsihp]]`→phishing、`[s[gnikcah]]`→hacking）。dsh 用户建议直接用上面的 CodeBuddy 预设：解码段常驻 system，转换器只负责转义、不会重复注入。
 
 ### ⚠️ 免责声明
