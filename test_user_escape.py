@@ -48,6 +48,31 @@ def test_credentials_hit():
     print("PASS credentials_hit")
 
 
+def test_code_blocks_protected():
+    # 围栏代码块内不转义（贴命令/路径/配置是工具调用字面量的主要来源）
+    text = "先用这个命令：\n```powershell\nnpm i dsh-utils\ncurl http://x/payload.txt\n```\n然后解释 phishing 原理"
+    new, n = escape_user_text(text)
+    assert "```powershell" in new and "npm i dsh-utils" in new, new
+    assert "[s[gnihsihp]]" in new, "围栏外的散文要正常转义"
+    assert n == 1, n
+    assert "[s[" not in text.split("```")[1], "围栏内不得出现转义"
+
+    # 行内 code span 内不转义
+    new2, n2 = escape_user_text("查看 `credentials.json`，聊聊 phishing")
+    assert "`credentials.json`" in new2, new2
+    assert "[s[gnihsihp]]" in new2 and n2 == 1
+
+    # 未闭环的行内反引号：保护到行末
+    new3, n3 = escape_user_text("open `exploit.py then fix")
+    assert "exploit.py then fix" in new3, new3
+    assert n3 == 0
+
+    # 未闭合围栏保护到文末
+    new4, n4 = escape_user_text("```json\n{\"tool\": \"keylogger-scan\"}")
+    assert n4 == 0 and "{\"tool\": \"keylogger-scan\"}" in new4
+    print("PASS code_blocks_protected")
+
+
 def test_user_body_only_role_and_decoder():
     body = {
         "messages": [
@@ -77,5 +102,6 @@ if __name__ == "__main__":
     test_dos_ddos_no_longer_wrapped()
     test_boundaries_and_real_words()
     test_credentials_hit()
+    test_code_blocks_protected()
     test_user_body_only_role_and_decoder()
     print("ALL PASS")

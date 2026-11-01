@@ -255,8 +255,22 @@ USER_ESCAPE_DECODER = (
 )
 
 
+_CODE_PROTECT_RE = re.compile(
+    r"```[\s\S]*?(?:```|\Z)"      # 围栏代码块（含未闭合到文末，同样保护）
+    r"|~~~[\s\S]*?(?:~~~|\Z)"     # ~~~ 围栏
+    r"|`[^`\n]*`"                 # 行内 code span（单反引号、不跨行）
+    r"|`[^`\n]*$",                # 未闭合反引号：保护到行末（与 rust 行为一致）
+    re.M,
+)
+
+
 def escape_user_text(text: str) -> tuple[str, int]:
-    """把文本里的转义词包成 [s[<reversed>]]。返回 (新文本, 命中数)。"""
+    """把文本里的转义词包成 [s[<reversed>]]。返回 (新文本, 命中数)。
+
+    代码块保护（2026-11-01）：``` 围栏、~~~ 围栏与行内 `code` 里的术语**不转义**
+    ——贴进用户消息的命令/路径/JSON 这类"需按字节复用的字面量"几乎都在代码块里，
+    跳过它们等于保护工具调用参数的还原路径；转义只作用于普通散文。
+    """
     if not text:
         return text, 0
     count = 0
@@ -266,8 +280,17 @@ def escape_user_text(text: str) -> tuple[str, int]:
         count += 1
         return "[s[" + m.group(0)[::-1] + "]]"
 
-    out = _USER_ESCAPE_PATTERN.sub(_rep, text)
-    return out, count
+    def _wrap(prose: str) -> str:
+        return _USER_ESCAPE_PATTERN.sub(_rep, prose)
+
+    out_parts: list[str] = []
+    last = 0
+    for m in _CODE_PROTECT_RE.finditer(text):
+        out_parts.append(_wrap(text[last:m.start()]))
+        out_parts.append(m.group(0))
+        last = m.end()
+    out_parts.append(_wrap(text[last:]))
+    return "".join(out_parts), count
 
 
 def _has_escape_codec(messages: Iterable[dict]) -> bool:
