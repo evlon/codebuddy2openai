@@ -228,11 +228,13 @@ def desensitize_tools(body: dict) -> tuple[dict, int]:
 
 USER_ESCAPE_TERMS: tuple[str, ...] = (
     # 按长度降序编译，避免短词先匹配吃掉长词（hack/hacking 同前缀族全列出）。
+    # 注：dos/ddos 已移除（2026-11-01）——"dos"误伤率过高（DOS 磁盘/DOS 换行符
+    # 在 Windows 开发字面量里很常见），模型把它反转回 dos 的成本不值得，摘掉
+    # 后这两词直接明文过关（后端对普通词不拦，内容审核只看真实有害意图）。
     "hacking", "hacker", "hack",
     "phishing", "phish",
     "malware", "ransomware", "botnet", "keylogger", "spyware", "rootkit",
     "backdoor", "trojan", "exploit", "credential", "credentials",
-    "dos", "ddos",
 )
 
 _USER_ESCAPE_PATTERN = re.compile(
