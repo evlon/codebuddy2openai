@@ -1316,6 +1316,12 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                     if tail:
                         raw_parts.append(tail)
                         yield tail
+                    # 成功消费完一轮就结束重试循环。缺这个 break 会让 attempt 2 把
+                    # 同一个请求体再发一次上游，客户端收到「两段完整流」（第二段
+                    # 的 delta 会被并入第一段：content 变「收到收到」、tool_calls
+                    # 的 arguments 变两段 JSON 拼接、name 变 "lsls"，JSON 解析失败后
+                    # 客户端把参数当成缺失 → 「missing required property」）。
+                    break
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
