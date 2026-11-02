@@ -246,7 +246,10 @@ codebuddy -p "Reply exactly: ok"
 
 ### ❓ 常见问题
 
-- **找不到登录文件**：路径见上方「前置条件」。**2026-11 桌面端升级 1.106.1 后**：IDE 登录态收进了 VS Code 式 SecretStorage（`...\CodeBuddy CN\User\globalStorage\state.vscdb` 加密条目），桌面端自身**不再往 `Data\Public\auth\` 写 `.info`**；重新登录/重装桌面端都不会让文件回来。恢复办法任何一条即可：① 跑一次官方 CLI 登录（`pwsh -NoProfile -File <node目录>\codebuddy.ps1`，CLI 登录会把完整凭据写回老路径，实测 2026-11-02，token 30 天有效期）；② 转换器自己临过期会自动刷新并回写该文件——只要文件存在且转换器在跑，登录态会一直续着。
+- **找不到登录文件**：路径见上方「前置条件」。**2026-11 桌面端升级 1.106.1 后**：IDE 登录态收进了 VS Code 式 SecretStorage（`...\CodeBuddy CN\User\globalStorage\state.vscdb` 加密条目），桌面端自身**不再往 `Data\Public\auth\` 写 `.info`**；重新登录/重装桌面端都不会让文件回来。恢复办法三条任选：
+    1. 跑一次官方 CLI 登录（`pwsh -NoProfile -File <node目录>\codebuddy.ps1`，CLI 登录会把完整凭据写回老路径，实测 2026-11-02，token 30 天有效期）；
+    2. 转换器自己临过期会自动刷新并回写该文件——只要文件存在且转换器在跑，登录态会一直续着；
+    3. `python -X utf8 export_auth_from_ide.py --dry-run`：直接解密 IDE SecretStorage 组装 `.info`（不依赖 CLI；去掉 `--dry-run` 正式写盘，目标已存在需 `--force`）。原理与安全提醒见脚本 docstring。
 - **客户端报 401**：转换器若用了 `--api-key`，客户端那边要带同样的 key；若是后端 401，可能是 token 失效（转换器会自动刷新，若仍失败需在桌面端重新登录）。
 - **响应慢**：可换 `deepseek-v4-flash` 等更快的模型。
 - **"敏感内容"被拦截 / `11128 Illegal API invocation from an unapproved channel`**：CodeBuddy 后端在模型推理之前做渠道风控 + 内容审核。实测（2026-10-21 与 2026-10-28 两轮）机制为**动态累计评分**，不是单一静态字面量：
