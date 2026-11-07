@@ -17,7 +17,7 @@
 - 🔄 **OpenAI 兼容**：标准 `/v1/chat/completions`（支持流式 SSE）、`/v1/models`、`/health`。
 - 🛠️ **Function Calling（工具调用）**：支持请求里的 `tools`，返回 OpenAI 格式的 `tool_calls`，可在 ZCode / Cherry Studio 等 agent 客户端里驱动工具、多轮回传结果。
 - 🪶 **单文件、极简**：核心就一个 `converter.py`，不复杂。
-- 🪪 **完整客户端身份面（v2.3）**：出站请求对齐官方 CLI（`@tencent-ai/codebuddy-code 2.177.0`，官方抓包逐字对齐）——UA `CLI/2.177.0 CodeBuddy/2.177.0`，常驻 `X-IDE-*` / `X-Product*` / `X-Private-Data` / 渠道标志与 trace/b3/baggage 链路头，每请求生成 `X-Conversation-ID` / `X-Request-ID` / `X-Agent-*`，body 补官方 `extra_vars.harnessMetadata` 等字段；token 剩余 <6h 自动续期、11128 渠道拦截自动强刷重试一次；15 个 `CLIENT_INFO_*` 环境变量覆盖通道与官方一致（详见下文「客户端身份面」）。
+- 🪪 **完整客户端身份面（v2.3）**：出站请求对齐官方 CLI（`@tencent-ai/codebuddy-code 2.181.0`，2026-11-07 官方抓包逐字对齐）——UA `CLI/2.181.0 CodeBuddy/2.181.0`，常驻 `X-IDE-*` / `X-Product*` / `X-Private-Data` / 渠道标志与 trace/b3/baggage 链路头，每请求生成 `X-Conversation-ID` / `X-Request-ID` / `X-Agent-*`，body 补官方 `extra_vars.harnessMetadata`/`interactionType` 等字段；token 剩余 <6h 自动续期、11128 渠道拦截自动强刷重试一次；15 个 `CLIENT_INFO_*` 环境变量覆盖通道与官方一致（详见下文「客户端身份面」）。
 - 🔐 **零授权改动**：直接调用本机已登录的 `codebuddy` CLI，自动复用桌面端登录态，不重新登录、不存密码。
 - 🖥️ **跨平台**：自动定位 macOS / Windows / Linux 上的 CLI 与登录文件。
 - 🛡️ **安全**：默认只监听 `127.0.0.1`；工具的声明与执行都由客户端负责，转换器只做鉴权与透传。
@@ -164,7 +164,7 @@ python3 converter.py [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [-
 | `--desensitize-scope` | `system` | 脱敏作用范围（需 `--desensitize`）。`system`=只处理 system 消息；`all`=扩展到 user/assistant/tool 消息与 `tools` 描述（2026-10-28 曾实测 71 处痕迹可打散 68 处）。**2026-10-29 实测后建议保持默认 `system`**：确认确定性硬拦点全在 system 预设里（签名 + @-路径段，由 strip-harness 改写），FULL replay 不打工具/用户痕迹也能全量放行；`all` 仅作为旁路备份（若哪天风控重新把工具痕迹计入评分再启用）。也可用环境变量 `CODEBUDDY2OPENAI_DESENSITIZE_SCOPE`。|
 | `--user-escape` | 关 | 启用**用户消息转义**：user 角色消息里命中词表（phishing/exploit/hack 等）的英文术语包成 `[s[<逐字反转>]]`（`phishing` → `[s[gnihsihp]]`）打断后端关键词匹配；**围栏/行内代码块里的术语不转义**（贴命令/路径/JSON 等需按字节复用的字面量在代码块保护区内，避免解码错误砸到 tool_call 参数）；若 system 里尚无解码说明还会自动补一段 `CODEBUDDY_ESCAPE_CODEC` 解码说明，模型自行反转还义。与 CodeBuddy 预设（见下）配对时解码说明由预设提供，不重复注入。也可用环境变量 `CODEBUDDY2OPENAI_USER_ESCAPE`。|
 | `--strip-harness` | `on` | **签名清洗（默认开）**：清洗 system 消息里 dsh 客户端的三段全局签名（`harness:identity` / `harness:source` / `app:web-surface`，均含字面量 `DeepSeek Harness`——后端 `11128` 渠道拦截的匹配源）、**@-路径语义段**（`Tokens prefixed with @ … quotes a path containing spaces.` 整段，2026-10-28 官方载体分块扫描确定性定位的第二处硬拦点，改为语义等效的中性改写），**并清洗 assistant 历史消息里的残留签名**（模型在 dsh persona 时期的自我介绍会存进会话历史，续聊回放照样触发 11128，实测 2026-10-28）。identity 改写为 `You are CodeBuddy Code.`，source 删除，web-surface 替换为中性等效文本；残留变体字面量兜底替换为 `CodeBuddy`。幂等，与 dsh CodeBuddy 预设的遮蔽互不冲突（双层防护）。`--strip-harness off`（或环境变量 `CODEBUDDY2OPENAI_STRIP_HARNESS=off`）可关。|
-| `--official-shape` | `on` | **官方请求形状补齐（默认开）**：body 里补官方客户端必带字段——`extra_vars.harnessMetadata`（`harnessVersion`/`stepIndex`/`contextWindowId`/`agent.depth` 的 JSON 串，2026-10-28 官方 2.177.0 抓包逐字对齐）与 `reasoning_effort`/`verbosity`/`cache_retention`/`reasoning_summary` 官方默认值。缺这些字段会被后端视为非官方客户端、推高渠道风险分。客户端显式指定时不覆盖。`--official-shape off`（或环境变量 `CODEBUDDY2OPENAI_OFFICIAL_SHAPE=off`）可关。|
+| `--official-shape` | `on` | **官方请求形状补齐（默认开）**：body 里补官方客户端必带字段——`extra_vars.harnessMetadata`（`harnessVersion`/`stepIndex`/`contextWindowId`/`agent.depth` 的 JSON 串）与 `extra_vars.initiator`/`extra_vars.interactionType`（2026-11-07 官方 2.181.0 抓包逐字对齐），以及 `reasoning_effort`/`verbosity`/`cache_retention`/`reasoning_summary` 官方默认值。缺这些字段会被后端视为非官方客户端、推高渠道风险分。客户端显式指定时不覆盖。`--official-shape off`（或环境变量 `CODEBUDDY2OPENAI_OFFICIAL_SHAPE=off`）可关。|
 | `--private-data` | `true` | `X-Private-Data` 身份头的取值。`true`=数据按隐私处理（禁用于模型优化）；`false` 与官方 SaaS 默认一致。也可用环境变量 `CODEBUDDY2OPENAI_PRIVATE_DATA`。|
 | `--sys-prefix` | `off` | 在 system 消息最上方注入官方 CLI 的提示词关键字（逆向自官方 CLI 的 `cli-agent-prompt`）。`short`=身份声明 `You are CodeBuddy Code.` + 一句 CLI 角色描述；`full`=`short` 再加官方 `<content_policy>` 合规块。让 dsh 等 agent 客户端的 system 贴近官方会话形态，并复用官方合规约束。也可用环境变量 `CODEBUDDY2OPENAI_SYS_PREFIX`。|
 | `--skip-check` | 否 | 跳过启动预检 |
@@ -188,12 +188,12 @@ python3 converter.py                              # 不记日志
 
 ### 🪪 客户端身份面（v2.3）
 
-本转换器把出站请求的**客户端身份声明**与官方 CLI（`@tencent-ai/codebuddy-code 2.177.0`，2026-10-28 官方请求抓包逐字对齐）对齐（身份头对照分析见仓库内 `SECURITY-REVIEW.md`）：
+本转换器把出站请求的**客户端身份声明**与官方 CLI（`@tencent-ai/codebuddy-code 2.181.0`，2026-11-07 官方请求抓包逐字对齐）对齐（身份头对照分析见仓库内 `SECURITY-REVIEW.md`）：
 
 | 维度 | 实现 |
 |------|------|
-| User-Agent | 按官方 `UserAgentHttpInterceptor.buildUserAgent()` 拼接：`<platform>/<platformVersion> <productName>/<productVersion> [extension]`，本机默认即官方抓包形态 `CLI/2.177.0 CodeBuddy/2.177.0`（可用环境变量 `CODEBUDDY2OPENAI_UA` 整体覆盖、`CODEBUDDY2OPENAI_UA_VERSION` 换版本） |
-| IDE/Product 标头 | 常驻 `X-IDE-Type: CLI`、`X-IDE-Name: CLI`、`X-IDE-Version: 2.177.0`、`X-Product: SaaS`（抓包实测值）、`X-Product-Version: 2.177.0`、`X-Requested-With: XMLHttpRequest`、`X-CodeBuddy-Request: 1`、`X-Agent-Purpose: conversation` |
+| User-Agent | 按官方 `UserAgentHttpInterceptor.buildUserAgent()` 拼接：`<platform>/<platformVersion> <productName>/<productVersion> [extension]`，本机默认即官方抓包形态 `CLI/2.181.0 CodeBuddy/2.181.0`（可用环境变量 `CODEBUDDY2OPENAI_UA` 整体覆盖、`CODEBUDDY2OPENAI_UA_VERSION` 换版本） |
+| IDE/Product 标头 | 常驻 `X-IDE-Type: CLI`、`X-IDE-Name: CLI`、`X-IDE-Version: 2.181.0`、`X-Product: SaaS`（抓包实测值）、`X-Product-Version: 2.181.0`、`X-Requested-With: XMLHttpRequest`、`X-CodeBuddy-Request: 1`、`X-Agent-Purpose: conversation` |
 | 隐私标志 | `X-Private-Data`：超时/企业策略语义；默认 `true`（数据不用于模型优化），`--private-data false` 与官方 SaaS 默认对齐 |
 | 每请求 ID | `X-Request-ID` = `X-Conversation-Message-ID`（32 位无连字符 UUID），`X-Conversation-Request-ID` = `X-Root-Request-ID`（独立根请求 UUID，与官方一致地分离消息/根 ID），`X-Conversation-ID` 默认每请求生成，也可由客户端透传同名头复用 |
 | 链路追踪标头 | 每请求生成官方 otel/b3 拦截器形态的 `traceparent`（`00-{32hex}-{16hex}-01`）、`b3`（`{trace}-{span}-1-{parent}`）、`X-B3-*`、`X-Trace-ID` 与 `baggage: codebuddy.session_id=…,codebuddy.conversation_request_id=…`；缺失属于非官方客户端特征。可用环境变量 `CODEBUDDY2OPENAI_TRACE=off` 关闭（排查用） |
@@ -283,7 +283,7 @@ A minimal local **protocol converter / proxy** that exposes your already-logged-
 - 🔄 **OpenAI-compatible**: standard `/v1/chat/completions` (streaming SSE), `/v1/models`, `/health`.
 - 🛠️ **Function Calling**: passes `tools` through and returns OpenAI-format `tool_calls`.
 - 🪶 **Single-file & minimal**: core is one `converter.py`.
-- 🪪 **Full official client identity (v2.3)**: outbound requests mirror the official CLI (`@tencent-ai/codebuddy-code 2.177.0`, byte-aligned with a captured official request) — UA, IDE/Product/channel headers, trace/b3/baggage, official body extras (`extra_vars.harnessMetadata` etc.), proactive token refresh (<6h margin) and a single retry on channel error 11128.
+- 🪪 **Full official client identity (v2.3)**: outbound requests mirror the official CLI (`@tencent-ai/codebuddy-code 2.181.0`, byte-aligned with a captured official request) — UA, IDE/Product/channel headers, trace/b3/baggage, official body extras (`extra_vars.harnessMetadata` etc.), proactive token refresh (<6h margin) and a single retry on channel error 11128.
 - 🔐 **Zero-auth hassle**: calls your locally-logged-in `codebuddy` CLI; reuses the desktop login session.
 - 🖥️ **Cross-platform**: auto-locates CLI & auth on macOS / Windows / Linux.
 - 🛡️ **Safe**: listens on `127.0.0.1` only; tool declarations and execution stay with the client — the converter only authenticates and forwards.

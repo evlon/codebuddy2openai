@@ -66,9 +66,9 @@ except ImportError:  # 模块缺失时降级为不脱敏
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 
-# 与官方 CLI 对齐的版本号（2026-10-28 官方 2.177.0 抓包实测：npm @tencent-ai/codebuddy-code
-# 2.177.0，UA 形态 `CLI/2.177.0 CodeBuddy/2.177.0`；可用环境变量 UA_VERSION 覆盖）。
-OFFICIAL_VERSION = os.environ.get("CODEBUDDY2OPENAI_UA_VERSION", "2.177.0")
+# 与官方 CLI 对齐的版本号（2026-11-07 官方 2.181.0 抓包实测：npm @tencent-ai/codebuddy-code
+# 2.181.0，UA 形态 `CLI/2.181.0 CodeBuddy/2.181.0`；可用环境变量 UA_VERSION 覆盖）。
+OFFICIAL_VERSION = os.environ.get("CODEBUDDY2OPENAI_UA_VERSION", "2.181.0")
 OFFICIAL_PRODUCT_NAME = "CodeBuddy"
 
 
@@ -948,6 +948,9 @@ async def chat_completions(request: Request,
                      "contextWindowId": str(uuid.uuid4()), "agent": {"depth": 0}},
                     separators=(",", ":")),
                 "initiator": "user",
+                # 2026-11-07 官方 2.181.0 抓包：首轮请求 extra_vars 带 interactionType:"prompt"
+                # （turn≥2 的续轮请求官方只带 harnessMetadata，不影响本转换器"每请求独立"的形态）
+                "interactionType": "prompt",
             }
         for _k, _v in (("reasoning_effort", "high"), ("verbosity", "high"),
                        ("cache_retention", "long"), ("reasoning_summary", "auto")):
@@ -1436,8 +1439,9 @@ def main():
                          "也可用环境变量 CODEBUDDY2OPENAI_STRIP_HARNESS=off 关闭。")
     ap.add_argument("--official-shape", default=os.environ.get("CODEBUDDY2OPENAI_OFFICIAL_SHAPE", "on"),
                     choices=["on", "off"],
-                    help="官方请求形状补齐（默认 on；2026-10-28 官方 2.177.0 抓包对齐）：body 补"
-                         "extra_vars.harnessMetadata/initiator 与 reasoning_effort/verbosity/"
+                    help="官方请求形状补齐（默认 on；对齐 2026-11-07 官方 2.181.0 抓包）：body 补"
+                         "extra_vars.harnessMetadata/initiator/interactionType 与 "
+                         "reasoning_effort/verbosity/"
                          "cache_retention/reasoning_summary 官方默认值；缺这些字段会被后端视为"
                          "非官方客户端、推高渠道风险分（11128）。客户端显式指定时不覆盖。"
                          "也可用环境变量 CODEBUDDY2OPENAI_OFFICIAL_SHAPE=off 关闭。")
