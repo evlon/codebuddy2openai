@@ -1064,7 +1064,14 @@ async def chat_completions(request: Request,
                             wait = base_delay * attempt
                             _log(f"[{rid}] ── 11128 渠道拦截：强刷令牌+换身份头，冷却 {wait}s 后重试"
                                  f"（第 {attempt + 1}/{attempts} 次）")
-                            await asyncio.sleep(wait)
+                            try:
+                                await asyncio.sleep(wait)
+                            except asyncio.CancelledError:
+                                # 客户端在冷却等待期间断开/超时（挂起总长可达 delay*序号)，
+                                # 放弃剩余重试并按取消语义干净收尾，否则异常会穿透
+                                # ASGI 响应任务把整个进程炸掉（2026-11-08 实例崩溃现场）。
+                                _log(f"[{rid}] ── 11128 冷却等待 {wait}s 中客户端断开，放弃剩余重试")
+                                raise
                             cred.force_refresh()
                             headers = build_fresh_headers()
                             continue
@@ -1335,7 +1342,14 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                             wait = base_delay * attempt
                             _log(f"{prefix}── 11128 渠道拦截：强刷令牌+换身份头，冷却 {wait}s 后重试"
                                  f"（第 {attempt + 1}/{attempts} 次）")
-                            await asyncio.sleep(wait)
+                            try:
+                                await asyncio.sleep(wait)
+                            except asyncio.CancelledError:
+                                # 客户端在冷却等待期间断开/超时，放弃剩余重试并按取消语义
+                                # 干净收尾，否则 CancelledError 会穿透 ASGI 响应任务把
+                                # 进程炸掉（2026-11-08 实例崩溃现场）。
+                                _log(f"{prefix}── 11128 冷却等待 {wait}s 中客户端断开，放弃剩余重试")
+                                raise
                             cred.force_refresh()
                             headers = build_headers() if build_headers else headers
                             continue
