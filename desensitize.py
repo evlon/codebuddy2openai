@@ -19,7 +19,7 @@ development, credential testing, C2 frameworks ...」），属于**拒绝作恶*
    [s[<逐字反转>]]（如 phishing -> [s[gnihsihp]]），并在 system 缺解码说明时
    自动补一段 CODEBUDDY_ESCAPE_CODEC 解码说明让模型还义。仅当发生转义时补。
 
-只处理明确的词表，脱敏默认只作用于 system 角色的消息；转义默认只作用于
+只处理明确的词表，脱敏默认作用于 system/developer 角色的消息；转义默认只作用于
 user 角色消息。不改动其它角色内容，避免影响真实对话。
 
 设计原则
@@ -121,10 +121,11 @@ def _iter_text_blocks(content):
 
 
 def desensitize_messages(messages: Iterable[dict],
-                         roles: tuple[str, ...] = ("system",)) -> list[dict]:
+                         roles: tuple[str, ...] = ("system", "developer")) -> list[dict]:
     """对指定角色的消息文本做脱敏，返回新的 messages 列表（不修改原对象）。
 
-    默认只处理 system 角色（合规模板集中地）。如需扩大，传 roles=("system","user")。
+    默认处理 system/developer 角色（合规模板集中地；dsh 0.2.x 起 identity 段
+    走 developer 角色，见 strip_harness_messages 注释）。如需扩大，传 roles 加 "user"。
     """
     out: list[dict] = []
     for m in messages:
@@ -151,7 +152,7 @@ def desensitize_messages(messages: Iterable[dict],
     return out
 
 
-def desensitize_body(body: dict, roles: tuple[str, ...] = ("system",)) -> dict:
+def desensitize_body(body: dict, roles: tuple[str, ...] = ("system", "developer")) -> dict:
     """对请求体里的 messages 做脱敏，返回新的 body（浅拷贝）。"""
     if not body.get("messages"):
         return body
@@ -442,8 +443,11 @@ def strip_harness_text(text: str) -> tuple[str, int]:
 
 
 def strip_harness_messages(messages: list[dict]) -> tuple[list[dict], int]:
-    """对 system（全套清洗）与 assistant（残留兜底）角色做签名清洗。
+    """对 system/developer（全套清洗）与 assistant（残留兜底）角色做签名清洗。
 
+    developer 角色必须清洗（2026-11-07 实测）：dsh 0.2.x 起把 identity/source/
+    web-surface 三段签名从 system 搬进了 role=developer 消息，三者原样含
+    "DeepSeek Harness" 字面量——只清 system 挡不住，裸奔直接触发 11128。
     assistant 历史必须清洗（实测 2026-10-28）：模型在 dsh persona 时期的自我介绍
     （"我是由 DeepSeek Harness 驱动的…"）会被存进会话历史，续聊回放时照样触发
     11128——只清 system 挡不住历史包袱。历史里只做残留替换（DeepSeek Harness →
@@ -453,11 +457,11 @@ def strip_harness_messages(messages: list[dict]) -> tuple[list[dict], int]:
     count = 0
     for m in messages:
         nm = dict(m) if isinstance(m, dict) else m
-        if isinstance(m, dict) and m.get("role") in ("system", "assistant"):
+        if isinstance(m, dict) and m.get("role") in ("system", "developer", "assistant"):
             content = m.get("content")
 
             def _clean(text: str, role: str) -> tuple[str, int]:
-                if role == "system":
+                if role in ("system", "developer"):
                     return strip_harness_text(text)
                 new, n = _HARNESS_RESIDUAL_RE.subn("CodeBuddy", text)
                 return new, n

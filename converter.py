@@ -53,7 +53,7 @@ try:
     from desensitize import (desensitize_body, desensitize_tools,
                              escape_user_body, strip_harness_body)
 except ImportError:  # 模块缺失时降级为不脱敏
-    def desensitize_body(body, roles=("system",)):
+    def desensitize_body(body, roles=("system", "developer")):
         return body
 
     def desensitize_tools(body):
@@ -712,6 +712,10 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "log_keep": 3,
                 "desensitize": False, "catalog": None, "models_ttl": 600.0,
                 "sys_prefix": "off", "user_escape": False, "strip_harness": True,
                 "official_shape": True,
+                # 11128 冷却自愈（--retry-11128）。实测 2026-11-07：11128 是按账号滚动的
+                # 渠道热度/冷却机制，同一被拦请求体约 1 小时后可原样放行；立即重试只会
+                # 继续加热。默认开：递增冷却（delay*attempt，60/120/240s）后重试。
+                "retry_11128": True, "retry_11128_delay": 60, "retry_11128_max": 3,
                 # X-Private-Data 的取值（true=数据按隐私处理，禁用于模型优化）。
                 # 官方语义：模型优化开启时发 "false"，关闭/企业策略时发 "true"。
                 # 这里默认 "true"（对应官方"优化关闭/企业保护"的隐私更优侧），
@@ -956,7 +960,7 @@ async def chat_completions(request: Request,
                        ("cache_retention", "long"), ("reasoning_summary", "auto")):
             body.setdefault(_k, _v)
 
-    # strip-harness（默认开）：清洗 system 里的 DeepSeek Harness 签名（11128 拦截源）
+    # strip-harness（默认开）：清洗 system/developer 里的 DeepSeek Harness 签名（11128 拦截源）
     if CONFIG.get("strip_harness", True):
         body, harness_count = strip_harness_body(body)
         if harness_count:
@@ -977,18 +981,19 @@ async def chat_completions(request: Request,
              f"（{len(OFFICIAL_SYS_HEADER) if sys_prefix == 'short' else len(OFFICIAL_SYS_HEADER) + len(OFFICIAL_SYS_POLICY) + 2} 字符）")
 
     # 可选：脱敏。缓解客户端合规模板（如 ZCode 的 system 声明）被后端误判为敏感词。
-    # 默认只对 system 角色消息里的"合规声明高频词"插入零宽空格，不改用户输入。
+    # 默认对 system/developer 角色消息里的"合规声明高频词"插入零宽空格，不改用户输入
+    # （dsh 0.2.x 起 identity 签名段走 developer 角色，developer 必须与 system 同待遇）。
     # --desensitize-scope all 时扩展到 user/assistant/tool 消息与 tools 描述
     # （dsh 客户端的工具描述/笔记里的 dsh/DSH 痕迹是渠道风险分加重因子）。
     if CONFIG.get("desensitize"):
         scope = CONFIG.get("desensitize_scope", "system")
         if scope == "all":
-            body = desensitize_body(body, roles=("system", "user", "assistant", "tool"))
+            body = desensitize_body(body, roles=("system", "developer", "user", "assistant", "tool"))
             body, dsc = desensitize_tools(body)
             _log(f"[{rid}] ── desensitize(scope=all): 全角色 + tools 描述"
                  + (f"，tools 改写 {dsc} 处" if dsc else ""))
         else:
-            body = desensitize_body(body, roles=("system",))
+            body = desensitize_body(body, roles=("system", "developer"))
 
     # 日志：请求摘要
     model_name = payload.get("model", "auto")
@@ -1029,9 +1034,15 @@ async def chat_completions(request: Request,
         )
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应。
-    # 11128 自愈：渠道拦截时强刷令牌 + 换身份头重试一次（重试轰炸推高后端渠道热度）。
+    # 11128 自愈：渠道拦截时强刷令牌 + 换身份头，按递增冷却重试（实测 2026-11-07：
+    # 同一被拦请求体约 1 小时后原样放行——11128 是按账号滚动的渠道热度/冷却机制，
+    # 与单条请求内容无关，立刻重试只会继续加热；冷却 60s*attempt 后重试才起效）。
+    retry_on = CONFIG.get("retry_11128", True)
+    max_retries = max(int(CONFIG.get("retry_11128_max", 3)), 0) if retry_on else 1
+    base_delay = max(int(CONFIG.get("retry_11128_delay", 60)), 1) if retry_on else 2
+    attempts = 1 + max_retries
     collected = None
-    for attempt in (1, 2):
+    for attempt in range(1, attempts + 1):
         try:
             async with httpx.AsyncClient(timeout=300) as c:
                 async with c.stream("POST", url, headers=headers, json=body) as r:
@@ -1039,9 +1050,11 @@ async def chat_completions(request: Request,
                         raw = await r.aread()
                         _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
                         _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8','replace')}")
-                        if attempt == 1 and b"11128" in raw:
-                            _log(f"[{rid}] ── 11128 渠道拦截：强刷令牌+换身份头，2s 后重试一次")
-                            await asyncio.sleep(2)
+                        if attempt < attempts and b"11128" in raw:
+                            wait = base_delay * attempt
+                            _log(f"[{rid}] ── 11128 渠道拦截：强刷令牌+换身份头，冷却 {wait}s 后重试"
+                                 f"（第 {attempt + 1}/{attempts} 次）")
+                            await asyncio.sleep(wait)
                             cred.force_refresh()
                             headers = build_fresh_headers()
                             continue
@@ -1262,8 +1275,10 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
     → 重序列化发给客户端；[DONE] 与非数据行原样透传。清洗后的完整 SSE 落盘日志。
     一个 data 行内的 JSON 是完整值，因此 ZWSP 不会跨行漏洗。
 
-    11128 自愈：渠道拦截时强刷令牌并换新身份头重试一次（重试轰炸会推高后端
-    渠道热度，故只重试一次、间隔 2s）。
+    11128 自愈：渠道拦截时强刷令牌并换新身份头，按递增冷却重试（实测
+    2026-11-07：11128 是按账号滚动的渠道热度/冷却机制，与单条请求内容无关，
+    立即重试只会继续加热；默认冷却 60s*attempt，--retry-11128 off 时退化为
+    一次 2s 快速重试）。
     """
     finish_reason = None
     tool_names: list[str] = []
@@ -1293,17 +1308,24 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
 
     scrubber = _SSEScrubber(on_json=_stats)
 
+    retry_on = CONFIG.get("retry_11128", True)
+    max_retries = max(int(CONFIG.get("retry_11128_max", 3)), 0) if retry_on else 1
+    base_delay = max(int(CONFIG.get("retry_11128_delay", 60)), 1) if retry_on else 2
+    attempts = 1 + max_retries
+
     try:
-        for attempt in (1, 2):
+        for attempt in range(1, attempts + 1):
             async with httpx.AsyncClient(timeout=None) as c:
                 async with c.stream("POST", url, headers=headers, json=body) as r:
                     if r.status_code != 200:
                         err = await r.aread()
                         _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
                         _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8','replace')}")
-                        if attempt == 1 and cred is not None and b"11128" in err:
-                            _log(f"{prefix}── 11128 渠道拦截：强刷令牌+换身份头，2s 后重试一次")
-                            await asyncio.sleep(2)
+                        if attempt < attempts and cred is not None and b"11128" in err:
+                            wait = base_delay * attempt
+                            _log(f"{prefix}── 11128 渠道拦截：强刷令牌+换身份头，冷却 {wait}s 后重试"
+                                 f"（第 {attempt + 1}/{attempts} 次）")
+                            await asyncio.sleep(wait)
                             cred.force_refresh()
                             headers = build_headers() if build_headers else headers
                             continue
@@ -1433,8 +1455,9 @@ def main():
                          "与 dsh CodeBuddy 预设配对时，解码说明由预设提供，不重复注入。")
     ap.add_argument("--strip-harness", default=os.environ.get("CODEBUDDY2OPENAI_STRIP_HARNESS", "on"),
                     choices=["on", "off"],
-                    help="清洗 system 消息里的 DeepSeek Harness 签名（dsh 客户端的 identity/source/"
-                         "web-surface 三段，后端 11128 渠道拦截的匹配源）。默认 on：任何客户端漏出的"
+                    help="清洗 system/developer 消息里的 DeepSeek Harness 签名（dsh 客户端的 identity/source/"
+                         "web-surface 三段；dsh 0.2.x 起签名段从 system 改挂 developer 角色，两者同待遇，"
+                         "后端 11128 渠道拦截的匹配源）。默认 on：任何客户端漏出的"
                          "签名在出站前统一清洗（幂等，与 dsh CodeBuddy 预设的遮蔽互不冲突）。"
                          "也可用环境变量 CODEBUDDY2OPENAI_STRIP_HARNESS=off 关闭。")
     ap.add_argument("--official-shape", default=os.environ.get("CODEBUDDY2OPENAI_OFFICIAL_SHAPE", "on"),
@@ -1454,6 +1477,21 @@ def main():
                          "加重因子，全量打散用于压低整条请求的风险分（响应里模型可能回显"
                          "零宽字符，可见但无害）。也可用环境变量"
                          " CODEBUDDY2OPENAI_DESENSITIZE_SCOPE=all。")
+    ap.add_argument("--retry-11128", default=os.environ.get("CODEBUDDY2OPENAI_RETRY_11128", "on"),
+                    choices=["on", "off"],
+                    help="11128 渠道拦截的冷却自愈（默认 on）。实测 2026-11-07：11128 是按账号"
+                         "滚动的渠道热度/冷却机制，同一被拦请求体约 1 小时后可原样放行——立即"
+                         "重试只会继续加热。开启后拦截时强刷令牌+换身份头，按 retry-delay×重试"
+                         "序号递增冷却重试（默认 60s/120s/240s，最多挂起约 7 分钟，期间客户端"
+                         "无感）；off 时只保留一次 2s 快速重试。也可用环境变量"
+                         " CODEBUDDY2OPENAI_RETRY_11128=off。")
+    ap.add_argument("--retry-11128-delay", type=int,
+                    default=int(os.environ.get("CODEBUDDY2OPENAI_RETRY_11128_DELAY", "60") or 60),
+                    help="冷却重试的基础间隔秒数（默认 60，实际间隔 = delay × 重试序号，"
+                         "60/120/240 递增）。")
+    ap.add_argument("--retry-11128-max", type=int,
+                    default=int(os.environ.get("CODEBUDDY2OPENAI_RETRY_11128_MAX", "3") or 3),
+                    help="冷却重试最大次数（默认 3，总挂起上限约 delay×6；0=被拦后仅 2s 重试一次即放弃）。")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     args = ap.parse_args()
 
@@ -1465,6 +1503,9 @@ def main():
     CONFIG["strip_harness"] = args.strip_harness == "on"
     CONFIG["official_shape"] = args.official_shape == "on"
     CONFIG["desensitize_scope"] = args.desensitize_scope
+    CONFIG["retry_11128"] = args.retry_11128 == "on"
+    CONFIG["retry_11128_delay"] = max(int(args.retry_11128_delay), 1)
+    CONFIG["retry_11128_max"] = max(int(args.retry_11128_max), 0)
     # --log 直接指定文件路径即开启；不传则不记
     CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
     CONFIG["log_keep"] = max(0, int(args.log_keep))
@@ -1488,7 +1529,12 @@ def main():
         keep_note = f"（保留最近 {CONFIG['log_keep']} 次请求）" if CONFIG["log_keep"] else "（不轮转）"
         sys.stderr.write(f"   日志      : {CONFIG['log_path']}{keep_note}\n")
     if args.desensitize:
-        sys.stderr.write("   脱敏      : 已启用（system 合规词零宽处理）\n")
+        scope_note = "system/developer" if CONFIG["desensitize_scope"] == "system" else "全角色+tools"
+        sys.stderr.write(f"   脱敏      : 已启用（{scope_note} 合规词零宽处理）\n")
+    if CONFIG["retry_11128"]:
+        total = CONFIG["retry_11128_delay"] * (CONFIG["retry_11128_max"] * (CONFIG["retry_11128_max"] + 1) // 2)
+        sys.stderr.write(f"   11128自愈 : 已启用（递增冷却重试 {CONFIG['retry_11128_max']} 次，间隔 "
+                        f"{CONFIG['retry_11128_delay']}s×n，最长挂起 ~{total}s）\n")
     if CONFIG["sys_prefix"] != "off":
         sys.stderr.write(f"   sys前缀   : {CONFIG['sys_prefix']}（注入官方提示词关键字）\n")
     if CONFIG["user_escape"]:
