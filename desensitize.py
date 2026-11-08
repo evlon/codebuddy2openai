@@ -496,6 +496,74 @@ def strip_harness_body(body: dict) -> tuple[dict, int]:
     return nb, count
 
 
+def _content_text(content) -> str:
+    """取 content 全部文本（str 或块列表），供并入拼接用。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [blk["text"] for blk in content
+                 if isinstance(blk, dict) and blk.get("type") == "text"]
+        return "\n\n".join(p for p in parts if p)
+    return ""
+
+
+def merge_developer_messages(body: dict) -> tuple[dict, int]:
+    """把 role=developer 消息并入 role=system，返回 (new_body, 合并条数)。
+
+    实测（2026-11-08）：后端对**含 developer 角色消息**的请求直接 11128——
+    与内容无关（developer 内容已被 strip-harness 清洗成官方签名
+    "You are CodeBuddy Code." 对照实验仍 4 连拦；去掉该消息或同内容换
+    system 角色立即放行）。dsh 0.2.x 用 developer 承载 identity 段，出站前
+    必须并入。语义等价：OpenAI 的 developer 本就是"系统级指令"，合并进
+    system 不改变模型行为。
+
+    多条 developer 依次并入；无 system 时把第一条 developer 提升为 system。
+    content 为 str 或 [{type, text}, ...] 块列表都支持。不修改原对象。
+    """
+    if not body.get("messages"):
+        return body, 0
+    msgs = list(body["messages"])
+    if not any(isinstance(m, dict) and m.get("role") == "developer" for m in msgs):
+        return body, 0
+    new_msgs = [dict(m) if isinstance(m, dict) else m for m in msgs]
+    merged = 0
+    system_idx = next((k for k, m in enumerate(new_msgs)
+                       if isinstance(m, dict) and m.get("role") == "system"), None)
+    if system_idx is None:
+        # 无 system：把第一条 developer 提升为 system
+        for k, m in enumerate(new_msgs):
+            if isinstance(m, dict) and m.get("role") == "developer":
+                m["role"] = "system"
+                system_idx = k
+                merged += 1
+                break
+    if system_idx is None:
+        return body, 0
+    sysm = new_msgs[system_idx]
+    for m in new_msgs:
+        if not isinstance(m, dict) or m.get("role") != "developer":
+            continue
+        dev_text = _content_text(m.get("content"))
+        if not dev_text:
+            continue
+        scontent = sysm.get("content")
+        if isinstance(scontent, list):
+            scontent = list(scontent) + [{"type": "text", "text": dev_text}]
+        elif isinstance(scontent, str):
+            scontent = scontent + ("\n\n" + dev_text if scontent else dev_text)
+        else:
+            scontent = dev_text
+        sysm["content"] = scontent
+        merged += 1
+    if not merged:
+        return body, 0
+    out = [m for m in new_msgs
+           if not (isinstance(m, dict) and m.get("role") == "developer")]
+    nb = dict(body)
+    nb["messages"] = out
+    return nb, merged
+
+
 # ---------------------------------------------------------------------------
 # 自测：python3 desensitize.py
 # ---------------------------------------------------------------------------

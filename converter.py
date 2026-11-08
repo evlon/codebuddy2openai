@@ -51,12 +51,16 @@ import uvicorn
 
 try:
     from desensitize import (desensitize_body, desensitize_tools,
-                             escape_user_body, strip_harness_body)
+                             escape_user_body, merge_developer_messages,
+                             strip_harness_body)
 except ImportError:  # 模块缺失时降级为不脱敏
     def desensitize_body(body, roles=("system", "developer")):
         return body
 
     def desensitize_tools(body):
+        return body, 0
+
+    def merge_developer_messages(body):
         return body, 0
 
 # ---------------------------------------------------------------------------
@@ -962,6 +966,12 @@ async def chat_completions(request: Request,
 
     # strip-harness（默认开）：清洗 system/developer 里的 DeepSeek Harness 签名（11128 拦截源）
     if CONFIG.get("strip_harness", True):
+        # 先把 developer 角色并入 system（实测 2026-11-08：后端按 developer 角色
+        # 本身拦截 11128，与内容无关——内容清洗成官方签名也拦；dsh 0.2.x 用
+        # developer 承载 identity 段，出站前必须并入）。
+        body, dev_merged = merge_developer_messages(body)
+        if dev_merged:
+            _log(f"[{rid}] ── strip-harness: developer 消息并入 system {dev_merged} 条")
         body, harness_count = strip_harness_body(body)
         if harness_count:
             _log(f"[{rid}] ── strip-harness: 清洗 {harness_count} 处 DeepSeek Harness 签名")
@@ -1456,8 +1466,9 @@ def main():
     ap.add_argument("--strip-harness", default=os.environ.get("CODEBUDDY2OPENAI_STRIP_HARNESS", "on"),
                     choices=["on", "off"],
                     help="清洗 system/developer 消息里的 DeepSeek Harness 签名（dsh 客户端的 identity/source/"
-                         "web-surface 三段；dsh 0.2.x 起签名段从 system 改挂 developer 角色，两者同待遇，"
-                         "后端 11128 渠道拦截的匹配源）。默认 on：任何客户端漏出的"
+                         "web-surface 三段；dsh 0.2.x 起签名段从 system 改挂 developer 角色），并**把 developer "
+                         "消息并入 system**——实测 2026-11-08：后端按 developer 角色本身拦截 11128（内容清洗"
+                         "成官方签名也拦）。默认 on：任何客户端漏出的"
                          "签名在出站前统一清洗（幂等，与 dsh CodeBuddy 预设的遮蔽互不冲突）。"
                          "也可用环境变量 CODEBUDDY2OPENAI_STRIP_HARNESS=off 关闭。")
     ap.add_argument("--official-shape", default=os.environ.get("CODEBUDDY2OPENAI_OFFICIAL_SHAPE", "on"),
